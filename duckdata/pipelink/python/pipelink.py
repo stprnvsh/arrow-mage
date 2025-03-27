@@ -13,6 +13,9 @@ import argparse
 from typing import Dict, List, Any, Optional, Set
 import networkx as nx
 from pathlib import Path
+import warnings
+import uuid
+import time
 
 # Import monitoring module
 try:
@@ -97,6 +100,19 @@ def _validate_pipeline(pipeline: Dict[str, Any]) -> None:
                 raise ValueError(f"Data node '{node['id']}' missing required field: connection")
             if 'type' not in node['connection']:
                 raise ValueError(f"Data node '{node['id']}' connection missing required field: type")
+        
+        # Validate depends_on if present
+        if 'depends_on' in node:
+            depends_on = node['depends_on']
+            if isinstance(depends_on, str):
+                # Single dependency as string
+                pass  # Will check for existence later in build_dependency_graph
+            elif isinstance(depends_on, list):
+                # List of dependencies
+                if not all(isinstance(dep, str) for dep in depends_on):
+                    raise ValueError(f"Node '{node['id']}' has invalid depends_on format. Must be string or list of strings.")
+            else:
+                raise ValueError(f"Node '{node['id']}' has invalid depends_on format. Must be string or list of strings.")
 
 def _build_dependency_graph(pipeline: Dict[str, Any]) -> nx.DiGraph:
     """
@@ -116,21 +132,39 @@ def _build_dependency_graph(pipeline: Dict[str, Any]) -> nx.DiGraph:
     
     # Add edges for dependencies
     for node in pipeline['nodes']:
-        # Get inputs
+        # Check for explicit dependencies first
+        if 'depends_on' in node:
+            # Handle both single string and list formats
+            depends_on = node['depends_on']
+            if isinstance(depends_on, str):
+                depends_on = [depends_on]
+                
+            for dependency in depends_on:
+                if dependency not in G:
+                    raise ValueError(f"Node '{node['id']}' depends on non-existent node '{dependency}'")
+                G.add_edge(dependency, node['id'])
+        
+        # Get inputs (for backward compatibility and implicit dependencies)
         inputs = node.get('inputs', [])
         
         # Find nodes that produce these inputs
         for input_name in inputs:
             # Find the node that produces this output
+            producers = []
             for producer in pipeline['nodes']:
                 outputs = producer.get('outputs', [])
                 if input_name in outputs:
+                    producers.append(producer['id'])
                     # Add edge from producer to consumer
                     G.add_edge(producer['id'], node['id'])
+            
+            if not producers and inputs:
+                warnings.warn(f"Input '{input_name}' for node '{node['id']}' has no producer.")
     
     # Check for cycles
     if not nx.is_directed_acyclic_graph(G):
-        raise ValueError("Pipeline has circular dependencies")
+        cycles = list(nx.simple_cycles(G))
+        raise ValueError(f"Pipeline has circular dependencies. Cycles: {cycles}")
     
     return G
 
@@ -301,32 +335,30 @@ def _run_node(node_config: Dict[str, Any], pipeline_config: Dict[str, Any],
     
     return success
 
-def run_pipeline(pipeline_file: str, only_nodes: Optional[List[str]] = None,
-               start_from: Optional[str] = None, verbose: bool = False,
-               metrics_dir: Optional[str] = None, generate_report: bool = False) -> bool:
+def run_pipeline(pipeline_file: str, only_nodes: Optional[List[str]] = None, 
+               start_from: Optional[str] = None, verbose: bool = False) -> None:
     """
-    Run a pipeline
+    Run a pipeline from a YAML file
     
     Args:
         pipeline_file: Path to pipeline YAML file
         only_nodes: Only execute these nodes (and their dependencies)
         start_from: Start execution from this node
         verbose: Enable verbose output
-        metrics_dir: Directory to store metrics
-        generate_report: Whether to generate a performance report
-        
-    Returns:
-        bool: True if pipeline completed successfully, False otherwise
     """
-    # Get absolute path to pipeline file
-    pipeline_file = os.path.abspath(pipeline_file)
-    
-    # Set working directory to pipeline file directory by default
-    working_dir = os.path.dirname(pipeline_file)
+    logger.info(f"Loading pipeline from {pipeline_file}")
     
     # Load pipeline configuration
     with open(pipeline_file, 'r') as f:
         pipeline = yaml.safe_load(f)
+    
+    # Set up working directory
+    working_dir = os.path.dirname(os.path.abspath(pipeline_file))
+    if 'working_dir' in pipeline:
+        if os.path.isabs(pipeline['working_dir']):
+            working_dir = pipeline['working_dir']
+        else:
+            working_dir = os.path.normpath(os.path.join(working_dir, pipeline['working_dir']))
     
     # Validate pipeline configuration
     _validate_pipeline(pipeline)
@@ -337,53 +369,56 @@ def run_pipeline(pipeline_file: str, only_nodes: Optional[List[str]] = None,
     # Get execution order
     execution_order = _get_execution_order(G, only_nodes, start_from)
     
-    # Get all nodes to execute
-    nodes_to_execute = [node for node in pipeline['nodes'] if node['id'] in execution_order]
+    if verbose:
+        logger.info(f"Execution order: {', '.join(execution_order)}")
+    
+    # Determine pipeline database path
+    db_path = pipeline.get('db_path', 'pipeline.duckdb')
+    db_path = _resolve_path(working_dir, db_path)
+    
+    logger.info(f"Using database at {db_path}")
+    
+    # Generate a unique pipeline ID
+    pipeline_id = str(uuid.uuid4())
     
     # Initialize pipeline monitoring
-    PipelineMonitor.initialize(metrics_dir)
-    pipeline_id = PipelineMonitor.start_pipeline(pipeline['name'], [node['id'] for node in nodes_to_execute])
+    start_time = time.time()
+    PipelineMonitor.start_pipeline(
+        pipeline_id=pipeline_id,
+        pipeline_name=pipeline.get('name', 'Unnamed Pipeline'),
+        pipeline_file=pipeline_file,
+        nodes=execution_order
+    )
     
-    logger.info(f"Running pipeline '{pipeline['name']}'")
-    logger.info(f"Execution order: {', '.join(execution_order)}")
-    
-    # Override db_path if it's a relative path
-    if 'db_path' in pipeline and not os.path.isabs(pipeline['db_path']):
-        pipeline['db_path'] = os.path.join(working_dir, pipeline['db_path'])
-    
-    # Set working_dir if specified in pipeline
-    if 'working_dir' in pipeline:
-        working_dir = _resolve_path(working_dir, pipeline['working_dir'])
-    
-    # Run nodes in order
+    # Run each node in the execution order
     success = True
-    for node in nodes_to_execute:
-        try:
-            node_success = _run_node(node, pipeline, working_dir, pipeline_id, verbose)
-            if not node_success:
-                success = False
-                break
-        except Exception as e:
-            logger.error(f"Error running node '{node['id']}': {e}")
+    for node_id in execution_order:
+        # Get node configuration
+        node_config = G.nodes[node_id]
+        
+        # Run node
+        node_success = _run_node(node_config, pipeline, working_dir, pipeline_id, verbose)
+        
+        if not node_success:
             success = False
+            logger.error(f"Node '{node_id}' failed. Stopping pipeline.")
             break
     
-    # Complete pipeline monitoring
-    pipeline_metrics = PipelineMonitor.get_pipeline_metrics(pipeline_id)
-    if pipeline_metrics:
-        pipeline_metrics.complete_pipeline(success=success)
-        
-        # Generate report if requested
-        if generate_report:
-            report_dir = pipeline_metrics.generate_report()
-            logger.info(f"Pipeline performance report generated in {report_dir}")
+    # Finalize pipeline monitoring
+    end_time = time.time()
+    execution_time = round(end_time - start_time, 2)
+    
+    PipelineMonitor.finish_pipeline(
+        pipeline_id=pipeline_id,
+        success=success,
+        execution_time=execution_time
+    )
     
     if success:
-        logger.info(f"Pipeline '{pipeline['name']}' completed successfully")
+        logger.info(f"Pipeline completed successfully in {execution_time} seconds")
     else:
-        logger.error(f"Pipeline '{pipeline['name']}' failed")
-    
-    return success
+        logger.error(f"Pipeline failed after {execution_time} seconds")
+        sys.exit(1)
 
 def main():
     parser = argparse.ArgumentParser(description='PipeLink: Cross-Language Pipeline Orchestration')
@@ -391,8 +426,6 @@ def main():
     parser.add_argument('--only-nodes', help='Only execute these nodes (comma-separated)', default=None)
     parser.add_argument('--start-from', help='Start execution from this node', default=None)
     parser.add_argument('--verbose', help='Enable verbose output', action='store_true')
-    parser.add_argument('--metrics-dir', help='Directory to store metrics', default=None)
-    parser.add_argument('--generate-report', help='Generate performance report', action='store_true')
     
     args = parser.parse_args()
     
@@ -402,9 +435,7 @@ def main():
         args.pipeline_file, 
         only_nodes=only_nodes, 
         start_from=args.start_from, 
-        verbose=args.verbose,
-        metrics_dir=args.metrics_dir,
-        generate_report=args.generate_report
+        verbose=args.verbose
     )
 
 if __name__ == '__main__':

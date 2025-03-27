@@ -6,7 +6,7 @@ across Python, R, and Julia with seamless data sharing between steps.
 """
 
 # Set version
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # Define what gets imported with 'from pipelink import *'
 __all__ = ['run_pipeline', 'NodeContext']

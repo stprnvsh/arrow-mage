@@ -1,0 +1,68 @@
+name: DAG Pipeline Example
+description: A pipeline demonstrating DAG (Directed Acyclic Graph) capabilities
+db_path: dag_pipeline.duckdb
+working_dir: ./
+
+nodes:
+  # Data Generation Node
+  - id: generate_data
+    language: python
+    script: scripts/generate_data.py
+    outputs:
+      - raw_data
+    params:
+      rows: 1000
+      
+  # Multiple parallel processing branches
+  - id: clean_data
+    language: python
+    script: scripts/clean_data.py
+    depends_on: generate_data  # Explicit dependency
+    inputs:
+      - raw_data
+    outputs:
+      - cleaned_data
+      
+  - id: analyze_statistics
+    language: r
+    script: scripts/analyze_statistics.R
+    depends_on: generate_data  # Explicit dependency
+    inputs:
+      - raw_data
+    outputs:
+      - data_statistics
+  
+  - id: create_visualizations
+    language: python
+    script: scripts/create_visualizations.py
+    depends_on: generate_data  # Explicit dependency
+    inputs:
+      - raw_data
+    outputs:
+      - visualizations
+  
+  # Branch that depends on multiple previous nodes
+  - id: prepare_report
+    language: r
+    script: scripts/prepare_report.R
+    depends_on: 
+      - clean_data
+      - analyze_statistics
+    inputs:
+      - cleaned_data
+      - data_statistics
+    outputs:
+      - report_data
+  
+  # Final node that merges multiple branches
+  - id: generate_dashboard
+    language: python
+    script: scripts/generate_dashboard.py
+    depends_on:
+      - prepare_report
+      - create_visualizations
+    inputs:
+      - report_data
+      - visualizations
+    outputs:
+      - final_dashboard 

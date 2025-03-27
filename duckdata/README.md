@@ -206,4 +206,79 @@ MIT License
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request. 
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+### Pipeline Configuration
+
+Create a YAML file that defines your pipeline:
+
+```yaml
+name: My Data Pipeline
+description: Description of your pipeline
+db_path: data.duckdb
+working_dir: ./
+
+nodes:
+  - id: node_id
+    language: python  # or r, julia
+    script: path/to/script.py
+    inputs:
+      - input_dataset_name
+    outputs:
+      - output_dataset_name
+    params:
+      param1: value1
+      param2: value2
+```
+
+#### DAG Support
+
+PipeLink now supports DAG (Directed Acyclic Graph) pipelines, allowing complex workflows with multiple parallel branches and explicit dependencies:
+
+```yaml
+nodes:
+  # First node
+  - id: generate_data
+    language: python
+    script: scripts/generate.py
+    outputs:
+      - raw_data
+  
+  # Multiple parallel branches
+  - id: process_branch_a
+    language: python
+    script: scripts/process_a.py
+    depends_on: generate_data  # Explicit dependency
+    inputs:
+      - raw_data
+    outputs:
+      - processed_data_a
+  
+  - id: process_branch_b
+    language: r
+    script: scripts/process_b.R
+    depends_on: generate_data  # Explicit dependency
+    inputs:
+      - raw_data
+    outputs:
+      - processed_data_b
+  
+  # Node that depends on multiple upstream nodes
+  - id: combine_results
+    language: python
+    script: scripts/combine.py
+    depends_on:  # List of dependencies
+      - process_branch_a
+      - process_branch_b
+    inputs:
+      - processed_data_a
+      - processed_data_b
+    outputs:
+      - final_result
+```
+
+The `depends_on` field can be either a single node ID as a string or a list of node IDs to define explicit dependencies between nodes.
+
+#### Running Pipelines
+
+// ... existing code ... 

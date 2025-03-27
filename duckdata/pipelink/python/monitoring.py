@@ -24,21 +24,22 @@ logger = logging.getLogger('pipelink.monitoring')
 class PipelineMetrics:
     """Store and manage metrics for pipeline execution"""
     
-    def __init__(self, pipeline_id: str, pipeline_name: str, metrics_dir: Optional[str] = None):
+    def __init__(self, pipeline_id: str, pipeline_name: str, pipeline_file: str, nodes: List[str]):
         """
         Initialize PipelineMetrics
         
         Args:
             pipeline_id: Unique ID for the pipeline run
             pipeline_name: Name of the pipeline
-            metrics_dir: Directory to store metrics (default: ~/.pipelink/metrics)
+            pipeline_file: Path to the pipeline file
+            nodes: List of node IDs in the pipeline
         """
         self.pipeline_id = pipeline_id
         self.pipeline_name = pipeline_name
         self.start_time = datetime.datetime.now()
         self.end_time = None
         self.status = "initializing"
-        self.metrics_dir = metrics_dir or os.path.join(os.path.expanduser("~"), ".pipelink", "metrics")
+        self.pipeline_file = pipeline_file
         self.node_metrics = {}
         self.overall_metrics = {
             "nodes_total": 0,
@@ -52,10 +53,12 @@ class PipelineMetrics:
         self._resource_monitor_thread = None
         
         # Ensure metrics directory exists
-        os.makedirs(self.metrics_dir, exist_ok=True)
+        os.makedirs(os.path.join(os.path.expanduser("~"), ".pipelink", "metrics"), exist_ok=True)
         
         # Initialize metrics file
         self._save_metrics()
+        
+        self.start_pipeline(nodes)
     
     def start_pipeline(self, nodes: List[str]):
         """
@@ -176,18 +179,19 @@ class PipelineMetrics:
             duration_str = f"{node['duration']:.2f}s" if node['duration'] else "unknown"
             logger.error(f"Node '{node_id}' failed after {duration_str}: {error}")
     
-    def complete_pipeline(self, success: bool = True):
+    def complete_pipeline(self, success: bool, execution_time: float):
         """
         Record pipeline completion
         
         Args:
             success: Whether the pipeline completed successfully
+            execution_time: Total execution time in seconds
         """
         self.end_time = datetime.datetime.now()
         self.status = "completed" if success else "failed"
         
         # Calculate overall duration
-        duration = (self.end_time - self.start_time).total_seconds()
+        duration = execution_time
         self.overall_metrics["duration"] = duration
         
         # Stop resource monitoring
@@ -265,7 +269,7 @@ class PipelineMetrics:
             output_dir: Directory to save the report (default: metrics_dir)
         """
         if output_dir is None:
-            output_dir = self.metrics_dir
+            output_dir = os.path.join(os.path.expanduser("~"), ".pipelink", "metrics")
             
         os.makedirs(output_dir, exist_ok=True)
         
@@ -352,7 +356,7 @@ class PipelineMetrics:
     
     def _save_metrics(self):
         """Save metrics to disk"""
-        metrics_file = os.path.join(self.metrics_dir, f"{self.pipeline_id}.json")
+        metrics_file = os.path.join(os.path.join(os.path.expanduser("~"), ".pipelink", "metrics"), f"{self.pipeline_id}.json")
         
         # Prepare metrics data
         metrics_data = {
@@ -381,154 +385,63 @@ class PipelineMetrics:
 
 
 class PipelineMonitor:
-    """Singleton manager for pipeline monitoring"""
-    
-    _instance = None
-    _metrics_dir = None
-    _active_pipelines = {}
-    
-    @classmethod
-    def initialize(cls, metrics_dir: Optional[str] = None):
-        """
-        Initialize the pipeline monitor
-        
-        Args:
-            metrics_dir: Directory to store metrics (default: ~/.pipelink/metrics)
-        """
-        if cls._instance is None:
-            cls._instance = cls()
-            cls._metrics_dir = metrics_dir or os.path.join(os.path.expanduser("~"), ".pipelink", "metrics")
-            os.makedirs(cls._metrics_dir, exist_ok=True)
-            
-            logger.info(f"PipelineMonitor initialized with metrics directory: {cls._metrics_dir}")
+    """
+    Pipeline monitoring utilities.
+    """
+    _pipeline_metrics = {}  # Dictionary of pipeline metrics objects
     
     @classmethod
-    def start_pipeline(cls, pipeline_name: str, nodes: List[str]) -> str:
+    def start_pipeline(cls, pipeline_id: str, pipeline_name: str, pipeline_file: str, nodes: List[str]) -> str:
         """
-        Start monitoring a pipeline
+        Start monitoring a pipeline execution.
         
         Args:
+            pipeline_id: Unique identifier for this pipeline run
             pipeline_name: Name of the pipeline
+            pipeline_file: Path to the pipeline file
             nodes: List of node IDs in the pipeline
             
         Returns:
-            pipeline_id: Unique ID for the pipeline run
+            str: Pipeline ID
         """
-        if cls._instance is None:
-            cls.initialize()
-        
-        pipeline_id = str(uuid.uuid4())
-        metrics = PipelineMetrics(pipeline_id, pipeline_name, cls._metrics_dir)
-        metrics.start_pipeline(nodes)
-        
-        cls._active_pipelines[pipeline_id] = metrics
+        pipeline_metrics = PipelineMetrics(
+            pipeline_id=pipeline_id,
+            pipeline_name=pipeline_name,
+            pipeline_file=pipeline_file,
+            nodes=nodes
+        )
+        cls._pipeline_metrics[pipeline_id] = pipeline_metrics
         return pipeline_id
     
     @classmethod
-    def get_pipeline_metrics(cls, pipeline_id: str) -> Optional[PipelineMetrics]:
+    def finish_pipeline(cls, pipeline_id: str, success: bool, execution_time: float) -> None:
         """
-        Get metrics for a pipeline
+        Finish monitoring a pipeline execution.
+        
+        Args:
+            pipeline_id: Pipeline ID
+            success: Whether the pipeline completed successfully
+            execution_time: Total execution time in seconds
+        """
+        pipeline_metrics = cls.get_pipeline_metrics(pipeline_id)
+        if pipeline_metrics:
+            pipeline_metrics.complete_pipeline(
+                success=success,
+                execution_time=execution_time
+            )
+    
+    @classmethod
+    def get_pipeline_metrics(cls, pipeline_id: str) -> Optional['PipelineMetrics']:
+        """
+        Get pipeline metrics for a pipeline.
         
         Args:
             pipeline_id: Pipeline ID
             
         Returns:
-            PipelineMetrics object or None if not found
+            PipelineMetrics or None: Pipeline metrics object
         """
-        return cls._active_pipelines.get(pipeline_id)
-    
-    @classmethod
-    def list_active_pipelines(cls) -> List[Dict[str, Any]]:
-        """
-        List all active pipelines
-        
-        Returns:
-            List of pipeline info dictionaries
-        """
-        return [
-            {
-                "pipeline_id": pid,
-                "pipeline_name": metrics.pipeline_name,
-                "status": metrics.status,
-                "start_time": metrics.start_time,
-                "nodes_total": metrics.overall_metrics["nodes_total"],
-                "nodes_completed": metrics.overall_metrics["nodes_completed"],
-                "nodes_failed": metrics.overall_metrics["nodes_failed"],
-                "nodes_running": metrics.overall_metrics["nodes_running"],
-                "nodes_pending": metrics.overall_metrics["nodes_pending"],
-            }
-            for pid, metrics in cls._active_pipelines.items()
-        ]
-    
-    @classmethod
-    def load_pipeline_metrics(cls, pipeline_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Load metrics for a completed pipeline from disk
-        
-        Args:
-            pipeline_id: Pipeline ID
-            
-        Returns:
-            Dictionary of pipeline metrics or None if not found
-        """
-        if cls._instance is None:
-            cls.initialize()
-            
-        metrics_file = os.path.join(cls._metrics_dir, f"{pipeline_id}.json")
-        
-        if not os.path.exists(metrics_file):
-            return None
-            
-        try:
-            with open(metrics_file, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Error loading pipeline metrics: {e}")
-            return None
-    
-    @classmethod
-    def list_all_pipelines(cls) -> List[Dict[str, Any]]:
-        """
-        List all pipelines (active and completed)
-        
-        Returns:
-            List of pipeline info dictionaries
-        """
-        if cls._instance is None:
-            cls.initialize()
-            
-        pipelines = []
-        
-        # Add active pipelines
-        pipelines.extend(cls.list_active_pipelines())
-        
-        # Add completed pipelines from disk
-        try:
-            metrics_files = [f for f in os.listdir(cls._metrics_dir) if f.endswith(".json")]
-            
-            for metrics_file in metrics_files:
-                pipeline_id = metrics_file.replace(".json", "")
-                
-                # Skip active pipelines
-                if pipeline_id in cls._active_pipelines:
-                    continue
-                    
-                metrics = cls.load_pipeline_metrics(pipeline_id)
-                if metrics:
-                    pipelines.append({
-                        "pipeline_id": metrics["pipeline_id"],
-                        "pipeline_name": metrics["pipeline_name"],
-                        "status": metrics["status"],
-                        "start_time": metrics["start_time"],
-                        "end_time": metrics["end_time"],
-                        "nodes_total": metrics["overall_metrics"]["nodes_total"],
-                        "nodes_completed": metrics["overall_metrics"]["nodes_completed"],
-                        "nodes_failed": metrics["overall_metrics"]["nodes_failed"],
-                    })
-        except Exception as e:
-            logger.error(f"Error listing all pipelines: {e}")
-        
-        return pipelines
+        return cls._pipeline_metrics.get(pipeline_id)
 
 
 class ResourceMonitor:
