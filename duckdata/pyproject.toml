@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pipelink"
+version = "0.1.0"
+description = "Cross-language pipeline orchestration"
+readme = "README.md"
+authors = [
+    {name = "Your Name", email = "yourname@example.com"}
+]
+license = {text = "MIT"}
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "pyyaml",
+    "pandas",
+    "duckdb",
+    "numpy",
+    "networkx",
+    "pyarrow",
+    "psutil",      # For resource monitoring
+    "flask",       # For web dashboard
+    "matplotlib"   # For generating reports
+]
+
+[project.urls]
+"Homepage" = "https://github.com/yourusername/pipelink"
+"Bug Tracker" = "https://github.com/yourusername/pipelink/issues"
+
+[tool.setuptools]
+include-package-data = true 

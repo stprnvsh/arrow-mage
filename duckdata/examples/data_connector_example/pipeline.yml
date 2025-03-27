@@ -1,0 +1,37 @@
+name: Data Connector Example Pipeline
+description: Pipeline demonstrating the use of data connector nodes with different data sources
+db_path: data_pipeline.duckdb  # Path to CrossLink database
+working_dir: ./                # Working directory for scripts
+
+nodes:
+  - id: load_csv_data
+    language: data
+    connection:
+      type: file
+    params:
+      file_path: data/sample.csv
+      file_format: csv
+      output_name: raw_data
+      description: Raw data loaded from CSV file
+    outputs:
+      - raw_data
+      
+  - id: filter_data
+    language: python
+    script: scripts/filter_data.py
+    inputs:
+      - raw_data
+    outputs:
+      - filtered_data
+    params:
+      min_value: 1
+  
+  - id: generate_report
+    language: python
+    script: scripts/generate_report.py
+    inputs:
+      - filtered_data
+    outputs:
+      - customer_report
+  
+
