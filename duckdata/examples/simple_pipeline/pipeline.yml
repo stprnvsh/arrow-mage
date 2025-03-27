@@ -1,6 +1,6 @@
 name: Simple Data Transformation Pipeline
 description: A simple pipeline demonstrating cross-language data processing
-db_path: simple_pipeline.duckdb  # Path to CrossLink database
+db_path: simple_pipeline.duckdb
 working_dir: ./            # Working directory for scripts
 
 nodes:
