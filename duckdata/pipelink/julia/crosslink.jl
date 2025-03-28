@@ -5,9 +5,8 @@ using DataFrames
 using JSON
 using Dates
 using UUIDs
-import SHA: sha1
 
-export CrossLinkManager, push_data, pull_data, get_table_reference, register_external_table, list_datasets, query, close
+export CrossLinkManager, push_data, pull_data, get_table_reference, close
 
 """
     CrossLinkManager
@@ -180,44 +179,8 @@ function push_data(cl::CrossLinkManager, df::DataFrame, name::Union{String, Noth
     
     # Create table from DataFrame
     try
-        # Julia DuckDB doesn't have register() function like Python
-        # Instead, we can directly create the table by passing the DataFrame
-        # to execute via the FROM clause which makes it available as a variable
-        
-        # First create an empty table with the right schema
-        cols_with_types = []
-        for col_name in names(df)
-            # Map Julia types to SQL types
-            col_type = eltype(df[!, col_name])
-            sql_type = if col_type <: Integer
-                "BIGINT"
-            elseif col_type <: AbstractFloat
-                "DOUBLE"
-            elseif col_type <: AbstractString
-                "VARCHAR"
-            elseif col_type <: Bool
-                "BOOLEAN"
-            elseif col_type <: TimeType
-                "TIMESTAMP"
-            else
-                "VARCHAR" # Default to VARCHAR for other types
-            end
-            push!(cols_with_types, "\"$(col_name)\" $(sql_type)")
-        end
-        
-        # Create the table
-        schema_sql = join(cols_with_types, ", ")
-        DuckDB.execute(cl.conn, "CREATE OR REPLACE TABLE $(table_name) ($(schema_sql))")
-        
-        # Insert data row by row
-        for row in eachrow(df)
-            # Create placeholders and values array
-            placeholders = join(fill("?", length(names(df))), ", ")
-            values = [row[col] for col in names(df)]
-            
-            # Insert the row
-            DuckDB.execute(cl.conn, "INSERT INTO $(table_name) VALUES ($(placeholders))", values)
-        end
+        # Create table
+        DuckDB.execute(cl.conn, "CREATE OR REPLACE TABLE $table_name AS SELECT * FROM df")
         
         # Create schema
         schema_dict = Dict(
@@ -274,35 +237,13 @@ function pull_data(cl::CrossLinkManager, identifier::String; zero_copy::Bool=tru
     end
     
     # Log access
-    access_method = "copy"
+    log_access(cl, metadata["id"], "read", zero_copy ? "zero-copy" : "copy")
     
-    # Try zero-copy access if enabled
-    if zero_copy
-        # Get table reference for direct access
-        table_ref = get_table_reference(cl, identifier)
-        
-        # Connect directly to the database
-        conn = DuckDB.DB(table_ref["database_path"])
-        
-        # Query data with zero-copy
-        result = DataFrame(DuckDB.execute(conn, "SELECT * FROM $(table_ref["table_name"])"))
-        
-        access_method = "zero-copy"
-        
-        # Log zero-copy access
-        log_access(cl, metadata["id"], "read", access_method)
-        
-        return result
-    end
-    
-    # Standard access method (with copy)
+    # Get table name
     table_name = metadata["table_name"]
     
-    # Query data with standard method
+    # Query data
     result = DataFrame(DuckDB.execute(cl.conn, "SELECT * FROM $table_name"))
-    
-    # Log access
-    log_access(cl, metadata["id"], "read", access_method)
     
     return result
 end
@@ -333,85 +274,6 @@ function get_table_reference(cl::CrossLinkManager, identifier::String)
 end
 
 """
-    register_external_table(cl::CrossLinkManager, external_db_path::String, external_table_name::String;
-                           name::Union{String, Nothing}=nothing, description::Union{String, Nothing}=nothing)
-
-Register an external table from another DuckDB database without copying data.
-
-This enables true zero-copy access across different database files.
-"""
-function register_external_table(cl::CrossLinkManager, external_db_path::String, external_table_name::String;
-                                name::Union{String, Nothing}=nothing, description::Union{String, Nothing}=nothing)
-    # Generate dataset ID and name if not provided
-    dataset_id = string(uuid4())
-    if name === nothing
-        name = "ext_$(basename(external_db_path))_$(external_table_name)"
-    end
-    
-    # Use absolute path for external database
-    external_db_path = abspath(external_db_path)
-    attach_name = "ext_$(replace(dataset_id, "-" => "_"))"
-    
-    try
-        # Attach the external database
-        DuckDB.execute(cl.conn, "ATTACH DATABASE '$(external_db_path)' AS $(attach_name)")
-        
-        # Get schema information from the external table
-        schema_df = DataFrame(DuckDB.execute(cl.conn, "DESCRIBE $(attach_name).$(external_table_name)"))
-        
-        # Create a schema dictionary
-        schema_dict = Dict(
-            "columns" => schema_df.column_name,
-            "dtypes" => Dict(row.column_name => row.column_type for row in eachrow(schema_df))
-        )
-        
-        # Create a view to the external table
-        view_name = "ext_view_$(replace(dataset_id, "-" => "_"))"
-        DuckDB.execute(cl.conn, "CREATE VIEW $(view_name) AS SELECT * FROM $(attach_name).$(external_table_name)")
-        
-        # Calculate schema hash
-        schema_hash = bytes2hex(sha1(JSON.json(schema_dict)))
-        
-        # Store metadata
-        DuckDB.execute(cl.conn, """
-        INSERT INTO crosslink_metadata (
-            id, name, source_language, created_at, updated_at, description,
-            schema, table_name, arrow_data, version, current_version, schema_hash,
-            access_languages
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, [
-            dataset_id, 
-            name, 
-            "external", 
-            now(), 
-            now(),
-            description === nothing ? "External table reference to $(external_db_path):$(external_table_name)" : description,
-            JSON.json(schema_dict),
-            view_name,
-            false,
-            1,
-            true,
-            schema_hash,
-            JSON.json(["python", "r", "julia", "cpp"])
-        ])
-        
-        # Log access
-        log_access(cl, dataset_id, "reference", "external_table")
-        
-        return dataset_id
-    catch e
-        @error "Failed to register external table: $e"
-        # Try to detach the database if it was attached
-        try
-            DuckDB.execute(cl.conn, "DETACH DATABASE $(attach_name)")
-        catch
-            # Ignore errors during cleanup
-        end
-        rethrow(e)
-    end
-end
-
-"""
     close(cl::CrossLinkManager)
 
 Close database connection.
@@ -420,43 +282,6 @@ function close(cl::CrossLinkManager)
     # Database will be automatically closed when the connection is garbage collected
     # This is just for explicitness
     cl.conn = nothing
-end
-
-"""
-    list_datasets(cl::CrossLinkManager)
-
-List all available datasets in the CrossLink registry.
-"""
-function list_datasets(cl::CrossLinkManager)
-    try
-        result = DataFrame(DuckDB.execute(cl.conn, """
-        SELECT id, name, source_language, created_at, table_name, description, version 
-        FROM crosslink_metadata
-        WHERE current_version = TRUE
-        ORDER BY updated_at DESC
-        """))
-        
-        return result
-    catch e
-        @error "Failed to list datasets: $e"
-        return DataFrame()
-    end
-end
-
-"""
-    query(cl::CrossLinkManager, sql::String; use_arrow::Bool=true)
-
-Execute a SQL query on the CrossLink database.
-"""
-function query(cl::CrossLinkManager, sql::String; use_arrow::Bool=true)
-    try
-        # Execute query and return results
-        result = DataFrame(DuckDB.execute(cl.conn, sql))
-        return result
-    catch e
-        @error "Failed to execute query: $e"
-        rethrow(e)
-    end
 end
 
 end # module 

@@ -1,0 +1,55 @@
+name: Test Pipeline
+id: test_pipeline_001
+description: A simple test pipeline to verify PipeDuck installation
+db_path: test_pipeline.duckdb
+checkpointing:
+  enabled: true
+  frequency: node
+nodes:
+  - id: generate_data
+    name: Generate Data
+    description: Generate random test data
+    language: python
+    script: |
+      import pandas as pd
+      import numpy as np
+      
+      # Generate random data
+      data = pd.DataFrame({
+          'id': range(10),
+          'value': np.random.rand(10),
+          'category': np.random.choice(['A', 'B', 'C'], 10)
+      })
+      
+      # Register the data with DuckConnect
+      try:
+          duck_connect.register_dataset(data, 'test_data', description='Random test data')
+          print("Data registered successfully")
+      except Exception as e:
+          print(f"Error registering data: {e}")
+    outputs: [test_data]
+  
+  - id: transform_data
+    name: Transform Data
+    description: Apply simple transformations to the data
+    language: python
+    script: |
+      import pandas as pd
+      
+      # Load the input data
+      try:
+          data = duck_connect.get_dataset('test_data')
+          print(f"Loaded test_data: {data.shape}")
+          
+          # Apply transformations
+          data['value_squared'] = data['value'] ** 2
+          data['category_upper'] = data['category'].str.upper()
+          
+          # Register transformed data
+          duck_connect.register_dataset(data, 'transformed_data', description='Transformed test data')
+          print("Transformed data registered successfully")
+      except Exception as e:
+          print(f"Error processing data: {e}")
+    inputs: [test_data]
+    outputs: [transformed_data]
+    depends_on: [generate_data] 

@@ -12,63 +12,24 @@ import warnings
 import tempfile
 import hashlib
 from datetime import datetime
+from typing import Dict, List, Any, Optional, Union, Tuple
+import psutil
 
-class CrossLink:
-    def __init__(self, db_path="crosslink.duckdb"):
-        """
-        Initialize CrossLink with a database path.
+class CrossLinkMetadataManager:
+    """Metadata management for cross-language data sharing"""
+    
+    def __init__(self, conn):
+        """Initialize the metadata manager
         
         Args:
-            db_path: Path to the DuckDB database file
+            conn: DuckDB connection
         """
-        self.db_path = db_path
-        self.conn = duckdb.connect(db_path)
-        
-        # Install and load Arrow extension
-        try:
-            self.conn.execute("INSTALL arrow")
-            self.conn.execute("LOAD arrow")
-            self.arrow_available = True
-        except Exception as e:
-            warnings.warn(f"Arrow extension installation or loading failed: {e}")
-            warnings.warn("Some Arrow functionality may not be available")
-            self.arrow_available = False
-            
+        self.conn = conn
         self._setup_metadata_tables()
     
     def _setup_metadata_tables(self):
-        """Set up the metadata tables if they don't exist and configure DuckDB for large datasets."""
-        # Configure DuckDB for handling large datasets
-        try:
-            # Set memory limit to a percentage of available RAM (80%)
-            self.conn.execute("PRAGMA memory_limit='80%'")
-            
-            # Set threads to a reasonable number (adjust based on system capabilities)
-            import multiprocessing
-            num_cores = max(1, multiprocessing.cpu_count() - 1)  # Leave 1 core for other processes
-            self.conn.execute(f"PRAGMA threads={num_cores}")
-            
-            # Enable parallelism
-            self.conn.execute("PRAGMA force_parallelism")
-            
-            # Enable progress bar for long-running queries (useful for debugging)
-            self.conn.execute("PRAGMA enable_progress_bar")
-            
-            # Enable object cache for better performance with repeated queries
-            self.conn.execute("PRAGMA enable_object_cache")
-        except Exception as e:
-            warnings.warn(f"Failed to configure DuckDB performance settings: {e}")
-        
-        # Enable external IO if possible
-        try:
-            self.conn.execute("INSTALL httpfs")
-            self.conn.execute("LOAD httpfs")
-            self._httpfs_available = True
-        except Exception:
-            warnings.warn("httpfs extension not available. Remote file access will be limited.")
-            self._httpfs_available = False
-        
-        # Main metadata table for current versions
+        """Set up metadata tables for efficient cross-language data sharing"""
+        # Main metadata table for datasets
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS crosslink_metadata (
             id TEXT PRIMARY KEY,
@@ -83,7 +44,12 @@ class CrossLink:
             version INTEGER DEFAULT 1,
             current_version BOOLEAN DEFAULT TRUE,
             lineage TEXT,
-            schema_hash TEXT
+            schema_hash TEXT,
+            memory_map_path TEXT,         -- Path to memory-mapped file for zero-copy access
+            shared_memory_key TEXT,       -- Key for shared memory segment
+            arrow_schema TEXT,            -- Serialized Arrow schema for zero-copy
+            access_languages TEXT,        -- JSON array of languages that can access this dataset
+            memory_layout TEXT            -- Memory layout information for zero-copy access
         )
         """)
         
@@ -113,20 +79,17 @@ class CrossLink:
         )
         """)
         
-        # Performance metrics table
+        # Cross-language access tracking
         self.conn.execute("""
-        CREATE TABLE IF NOT EXISTS crosslink_performance_metrics (
-            id TEXT,
+        CREATE TABLE IF NOT EXISTS crosslink_access_log (
+            id TEXT PRIMARY KEY,
+            dataset_id TEXT,
+            language TEXT,
             operation TEXT,
-            started_at TIMESTAMP,
-            completed_at TIMESTAMP,
-            dataset_rows INTEGER,
-            dataset_columns INTEGER,
-            memory_used_mb DOUBLE,
-            execution_time_ms INTEGER,
+            timestamp TIMESTAMP,
+            access_method TEXT,       -- 'copy', 'zero-copy', 'view'
             success BOOLEAN,
-            error_message TEXT,
-            PRIMARY KEY (id, started_at)
+            error_message TEXT
         )
         """)
         
@@ -134,13 +97,13 @@ class CrossLink:
         self._ensure_columns_exist()
     
     def _ensure_columns_exist(self):
-        """Ensure all required columns exist in metadata table for backwards compatibility."""
+        """Ensure all required columns exist in metadata table"""
         columns_to_check = [
-            ("arrow_data", "BOOLEAN DEFAULT FALSE"),
-            ("version", "INTEGER DEFAULT 1"),
-            ("current_version", "BOOLEAN DEFAULT TRUE"),
-            ("lineage", "TEXT"),
-            ("schema_hash", "TEXT")
+            ("memory_map_path", "TEXT"),
+            ("shared_memory_key", "TEXT"),
+            ("arrow_schema", "TEXT"),
+            ("access_languages", "TEXT"),
+            ("memory_layout", "TEXT")
         ]
         
         for col_name, col_type in columns_to_check:
@@ -154,6 +117,193 @@ class CrossLink:
                 ALTER TABLE crosslink_metadata ADD COLUMN {col_name} {col_type}
                 """)
     
+    def create_dataset_metadata(self, dataset_id, name, table_name, source_language, schema,
+                              description=None, arrow_data=False, memory_map_path=None,
+                              shared_memory_key=None, arrow_schema=None, access_languages=None,
+                              memory_layout=None):
+        """Create metadata for a new dataset
+        
+        Args:
+            dataset_id: Unique ID for the dataset
+            name: Human-readable name
+            table_name: Table name in DuckDB
+            source_language: Language that created the dataset
+            schema: Schema as a dictionary
+            description: Optional dataset description
+            arrow_data: Whether data is in Arrow format
+            memory_map_path: Path to memory-mapped file for zero-copy
+            shared_memory_key: Key for shared memory segment
+            arrow_schema: Serialized Arrow schema
+            access_languages: Languages that can access this dataset
+            memory_layout: Memory layout information for zero-copy access
+            
+        Returns:
+            True if successful
+        """
+        # Set defaults
+        if access_languages is None:
+            access_languages = ["python", "r", "julia", "cpp"]
+        
+        schema_hash = hashlib.md5(json.dumps(schema, sort_keys=True).encode()).hexdigest()
+        
+        # Insert metadata
+        self.conn.execute("""
+        INSERT INTO crosslink_metadata (
+            id, name, source_language, created_at, updated_at, description,
+            schema, table_name, arrow_data, version, current_version,
+            schema_hash, memory_map_path, shared_memory_key, arrow_schema,
+            access_languages, memory_layout
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            dataset_id, name, source_language, datetime.now(), datetime.now(),
+            description or "", json.dumps(schema), table_name, arrow_data, 1, True,
+            schema_hash, memory_map_path, shared_memory_key,
+            json.dumps(arrow_schema) if arrow_schema else None,
+            json.dumps(access_languages), json.dumps(memory_layout) if memory_layout else None
+        ])
+        
+        return True
+    
+    def get_dataset_metadata(self, identifier):
+        """Get metadata for a dataset
+        
+        Args:
+            identifier: Dataset ID or name
+            
+        Returns:
+            Dictionary of metadata or None if not found
+        """
+        # Check if identifier is an ID or name
+        result = self.conn.execute("""
+        SELECT * FROM crosslink_metadata 
+        WHERE id = ? OR name = ?
+        """, [identifier, identifier]).fetchone()
+        
+        if not result:
+            return None
+            
+        # Convert result to dict
+        columns = [col[0] for col in self.conn.description]
+        metadata = {columns[i]: result[i] for i in range(len(columns))}
+        
+        # Parse JSON fields
+        for key in ['schema', 'lineage', 'arrow_schema', 'access_languages', 'memory_layout']:
+            if metadata.get(key):
+                try:
+                    metadata[key] = json.loads(metadata[key])
+                except:
+                    pass
+                    
+        return metadata
+    
+    def update_dataset_metadata(self, dataset_id, **updates):
+        """Update metadata for an existing dataset
+        
+        Args:
+            dataset_id: Dataset ID
+            **updates: Fields to update
+            
+        Returns:
+            True if successful
+        """
+        # Convert dict values to JSON
+        for key, value in updates.items():
+            if key in ['schema', 'arrow_schema', 'access_languages', 'memory_layout'] and value is not None:
+                updates[key] = json.dumps(value)
+        
+        # Always update the updated_at timestamp
+        updates['updated_at'] = datetime.now()
+        
+        # Build SQL update statement
+        set_clause = ", ".join([f"{key} = ?" for key in updates.keys()])
+        values = list(updates.values()) + [dataset_id]
+        
+        # Update metadata
+        self.conn.execute(f"""
+        UPDATE crosslink_metadata 
+        SET {set_clause}
+        WHERE id = ?
+        """, values)
+        
+        return True
+    
+    def log_access(self, dataset_id, language, operation, access_method, success=True, error_message=None):
+        """Log cross-language access to a dataset
+        
+        Args:
+            dataset_id: Dataset ID
+            language: Language accessing the dataset
+            operation: Operation (read, write, etc.)
+            access_method: Method of access (copy, zero-copy, view)
+            success: Whether access was successful
+            error_message: Error message if access failed
+            
+        Returns:
+            True if log was created
+        """
+        log_id = str(uuid.uuid4())
+        
+        self.conn.execute("""
+        INSERT INTO crosslink_access_log (
+            id, dataset_id, language, operation, timestamp, 
+            access_method, success, error_message
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            log_id, dataset_id, language, operation, datetime.now(),
+            access_method, success, error_message
+        ])
+        
+        return True
+
+class CrossLink:
+    def __init__(self, db_path="crosslink.duckdb"):
+        """
+        Initialize CrossLink with a database path.
+        
+        Args:
+            db_path: Path to the DuckDB database file
+        """
+        self.db_path = db_path
+        self.conn = duckdb.connect(db_path)
+        
+        # Install and load Arrow extension
+        try:
+            self.conn.execute("INSTALL arrow")
+            self.conn.execute("LOAD arrow")
+            self.arrow_available = True
+        except Exception as e:
+            warnings.warn(f"Arrow extension installation or loading failed: {e}")
+            warnings.warn("Some Arrow functionality may not be available")
+            self.arrow_available = False
+        
+        # Initialize metadata manager
+        self.metadata_manager = CrossLinkMetadataManager(self.conn)
+        
+        # Configure DuckDB for performance
+        self._configure_duckdb()
+    
+    def _configure_duckdb(self):
+        """Configure DuckDB for optimal performance"""
+        try:
+            # Set memory limit to a specific amount instead of percentage
+            # DuckDB expects units like MB, GB, etc.
+            total_memory = psutil.virtual_memory().total
+            memory_limit_mb = int(total_memory * 0.8 / (1024 * 1024))  # 80% of total memory in MB
+            self.conn.execute(f"PRAGMA memory_limit='{memory_limit_mb}MB'")
+            
+            # Set threads to a reasonable number
+            import multiprocessing
+            num_cores = max(1, multiprocessing.cpu_count() - 1)
+            self.conn.execute(f"PRAGMA threads={num_cores}")
+            
+            # Enable parallelism
+            self.conn.execute("PRAGMA force_parallelism")
+            
+            # Enable object cache for better performance with repeated queries
+            self.conn.execute("PRAGMA enable_object_cache")
+        except Exception as e:
+            warnings.warn(f"Failed to configure DuckDB performance settings: {e}")
+    
     def _compute_schema_hash(self, df):
         """Compute a hash of the dataframe schema for detecting changes."""
         schema_dict = {
@@ -162,54 +312,6 @@ class CrossLink:
         }
         schema_str = json.dumps(schema_dict, sort_keys=True)
         return hashlib.md5(schema_str.encode()).hexdigest()
-    
-    def _detect_schema_changes(self, old_schema, new_df):
-        """
-        Detect schema changes between old schema and new dataframe.
-        
-        Returns:
-            dict: Description of changes
-        """
-        if not old_schema:
-            return {"change_type": "initial_schema"}
-            
-        old_schema_dict = json.loads(old_schema)
-        old_columns = set(old_schema_dict.get('columns', []))
-        old_dtypes = old_schema_dict.get('dtypes', {})
-        
-        new_columns = set(new_df.columns)
-        new_dtypes = {col: str(new_df[col].dtype) for col in new_df.columns}
-        
-        added_columns = new_columns - old_columns
-        removed_columns = old_columns - new_columns
-        common_columns = old_columns.intersection(new_columns)
-        
-        changed_dtypes = {
-            col: (old_dtypes.get(col), new_dtypes.get(col))
-            for col in common_columns
-            if old_dtypes.get(col) != new_dtypes.get(col)
-        }
-        
-        changes = {
-            "added_columns": list(added_columns),
-            "removed_columns": list(removed_columns),
-            "changed_dtypes": changed_dtypes
-        }
-        
-        if added_columns or removed_columns or changed_dtypes:
-            if removed_columns:
-                change_type = "breaking"
-            elif added_columns and not changed_dtypes:
-                change_type = "non_breaking_addition"
-            else:
-                change_type = "potentially_breaking"
-        else:
-            change_type = "no_change"
-            
-        return {
-            "change_type": change_type,
-            "changes": changes
-        }
     
     def list_datasets(self):
         """List all available datasets in the CrossLink registry."""
@@ -224,763 +326,528 @@ class CrossLink:
             'id', 'name', 'source_language', 'created_at', 'table_name', 'description', 'version'
         ])
     
-    def list_dataset_versions(self, identifier):
+    def push(self, df, name=None, description=None, use_arrow=True, sources=None, transformation=None,
+             enable_zero_copy=True, shared_memory=True, access_languages=None):
+        """Push a dataframe to the shared database with metadata for zero-copy access
+        
+        Args:
+            df: Pandas DataFrame or PyArrow Table to push
+            name: Name for the dataset (will be auto-generated if None)
+            description: Optional description
+            use_arrow: Whether to use Arrow for data transfer
+            sources: Optional list of source dataset IDs
+            transformation: Description of transformation applied
+            enable_zero_copy: Enable zero-copy access between languages
+            shared_memory: Use shared memory for zero-copy access
+            access_languages: Languages that can access this dataset
+            
+        Returns:
+            dataset_id: ID of the registered dataset
         """
-        List all versions of a dataset.
+        # Generate dataset ID and name if not provided
+        dataset_id = str(uuid.uuid4())
+        if name is None:
+            name = f"dataset_{int(time.time())}"
+        
+        # Create table name (sanitized from dataset name)
+        table_name = f"data_{name.replace(' ', '_').replace('-', '_').lower()}"
+        
+        # Convert to PyArrow table if using Arrow and not already an Arrow table
+        arrow_table = None
+        if use_arrow and self.arrow_available:
+            if isinstance(df, pa.Table):
+                arrow_table = df
+            else:
+                arrow_table = pa.Table.from_pandas(df)
+        
+        # Create DuckDB table from DataFrame
+        if use_arrow and self.arrow_available and arrow_table is not None:
+            # Create table from Arrow data
+            self.conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM arrow_table")
+        else:
+            # Create table from pandas DataFrame
+            self.conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM df")
+        
+        # Prepare metadata
+        schema_dict = {
+            'columns': list(df.columns),
+            'dtypes': {col: str(df[col].dtype) for col in df.columns}
+        }
+        
+        # Prepare zero-copy access metadata
+        memory_map_path = None
+        shared_memory_key = None
+        arrow_schema = None
+        memory_layout = None
+        
+        if enable_zero_copy and self.arrow_available and arrow_table is not None:
+            # Serialize Arrow schema for zero-copy access
+            arrow_schema = {
+                'schema': arrow_table.schema.to_string(),
+                'metadata': {k.decode(): v.decode() for k, v in arrow_table.schema.metadata.items()} if arrow_table.schema.metadata else {}
+            }
+            
+            # Create memory layout information
+            memory_layout = self._create_memory_layout(arrow_table)
+            
+            # If using shared memory, set up shared memory key
+            if shared_memory:
+                shared_memory_key = f"crosslink_{dataset_id}"
+                
+                # Store Arrow table in shared memory for zero-copy access
+                self._store_in_shared_memory(arrow_table, shared_memory_key)
+        
+        # Create metadata entry
+        self.metadata_manager.create_dataset_metadata(
+            dataset_id=dataset_id,
+            name=name,
+            table_name=table_name,
+            source_language="python",
+            schema=schema_dict,
+            description=description,
+            arrow_data=use_arrow and self.arrow_available,
+            memory_map_path=memory_map_path,
+            shared_memory_key=shared_memory_key,
+            arrow_schema=arrow_schema,
+            access_languages=access_languages,
+            memory_layout=memory_layout
+        )
+        
+        # Log the operation
+        self.metadata_manager.log_access(
+            dataset_id=dataset_id,
+            language="python",
+            operation="write",
+            access_method="zero-copy" if enable_zero_copy else "copy",
+            success=True
+        )
+        
+        return dataset_id
+    
+    def _create_memory_layout(self, arrow_table):
+        """Create memory layout information for zero-copy access
+        
+        Args:
+            arrow_table: PyArrow Table
+            
+        Returns:
+            Memory layout dictionary
+        """
+        # Extract memory layout information from Arrow table
+        layout = {
+            'num_rows': arrow_table.num_rows,
+            'num_columns': arrow_table.num_columns,
+            'columns': []
+        }
+        
+        # Add information about each column
+        for i, col in enumerate(arrow_table.columns):
+            col_layout = {
+                'name': arrow_table.column_names[i],
+                'type': str(col.type),
+                'null_count': col.null_count,
+                'buffers': []
+            }
+            
+            # Handle ChunkedArray - get buffers from chunks if possible
+            try:
+                # For ChunkedArray, we need to get buffers from each chunk
+                if hasattr(col, 'chunks') and len(col.chunks) > 0:
+                    # Use the first chunk for layout information
+                    chunk = col.chunks[0]
+                    if hasattr(chunk, 'buffers'):
+                        for j, buf in enumerate(chunk.buffers()):
+                            if buf is not None:
+                                col_layout['buffers'].append({
+                                    'index': j,
+                                    'size': buf.size,
+                                    'offset': buf.address
+                                })
+                            else:
+                                col_layout['buffers'].append(None)
+                # If it's not a ChunkedArray, try to get buffers directly
+                elif hasattr(col, 'buffers'):
+                    for j, buf in enumerate(col.buffers()):
+                        if buf is not None:
+                            col_layout['buffers'].append({
+                                'index': j,
+                                'size': buf.size,
+                                'offset': buf.address
+                            })
+                        else:
+                            col_layout['buffers'].append(None)
+                else:
+                    # If we can't get buffers, just record basic info
+                    col_layout['buffers'] = None
+            except Exception as e:
+                # If there's any error, just skip buffer info
+                warnings.warn(f"Could not get buffer information for column {i}: {e}")
+                col_layout['buffers'] = None
+            
+            layout['columns'].append(col_layout)
+        
+        return layout
+    
+    def _store_in_shared_memory(self, arrow_table, key):
+        """Store Arrow table in shared memory for zero-copy access
+        
+        Args:
+            arrow_table: PyArrow Table
+            key: Shared memory key
+            
+        Returns:
+            True if successful
+        """
+        try:
+            import pyarrow.plasma as plasma
+            # Create connection to plasma store
+            plasma_client = plasma.connect("/tmp/plasma")
+            
+            # Serialize the table to an object ID
+            object_id = plasma.ObjectID.from_random()
+            data_size = pa.ipc.get_record_batch_size(pa.RecordBatch.from_pandas(arrow_table.to_pandas()))
+            
+            # Create buffer in plasma store
+            buffer = plasma_client.create(object_id, data_size)
+            
+            # Write serialized data to buffer
+            writer = pa.RecordBatchFileWriter(buffer, arrow_table.schema)
+            writer.write_table(arrow_table)
+            writer.close()
+            
+            # Seal the object
+            plasma_client.seal(object_id)
+            
+            # Store the object ID in metadata
+            self.conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS crosslink_plasma_objects (
+                key TEXT PRIMARY KEY,
+                object_id TEXT,
+                created_at TIMESTAMP
+            )
+            """)
+            
+            self.conn.execute("""
+            INSERT INTO crosslink_plasma_objects (key, object_id, created_at)
+            VALUES (?, ?, ?)
+            """, [key, str(object_id), datetime.now()])
+            
+            return True
+        except ImportError:
+            warnings.warn("PyArrow plasma module not available. Shared memory storage disabled.")
+            return False
+        except Exception as e:
+            warnings.warn(f"Failed to store data in shared memory: {e}")
+            return False
+    
+    def pull(self, identifier, to_pandas=True, use_arrow=True, zero_copy=True):
+        """Pull a dataset with zero-copy optimization when possible
         
         Args:
             identifier: Dataset ID or name
+            to_pandas: Convert to pandas DataFrame (if False, returns Arrow Table)
+            use_arrow: Use Arrow for data transfer
+            zero_copy: Attempt zero-copy when possible
             
         Returns:
-            DataFrame containing version information
+            DataFrame or Arrow Table
         """
-        result = self.conn.execute("""
-        SELECT id, name, version, created_at, updated_at, schema_hash, current_version
-        FROM crosslink_metadata 
-        WHERE id = ? OR name = ?
-        ORDER BY version DESC
-        """, (identifier, identifier)).fetchall()
-        
-        if not result:
+        # Get metadata
+        metadata = self.metadata_manager.get_dataset_metadata(identifier)
+        if not metadata:
             raise ValueError(f"Dataset with identifier '{identifier}' not found")
         
-        return pd.DataFrame(result, columns=[
-            'id', 'name', 'version', 'created_at', 'updated_at', 'schema_hash', 'current_version'
-        ])
+        # Log the access
+        access_method = "copy"
+        
+        # Try zero-copy access if enabled
+        if zero_copy and use_arrow and self.arrow_available and metadata.get('arrow_data'):
+            # Check if data is available via shared memory
+            if metadata.get('shared_memory_key'):
+                try:
+                    # Get from shared memory
+                    result = self._get_from_shared_memory(metadata['shared_memory_key'])
+                    if result is not None:
+                        access_method = "zero-copy"
+                        
+                        # Log successful access
+                        self.metadata_manager.log_access(
+                            dataset_id=metadata['id'],
+                            language="python",
+                            operation="read",
+                            access_method=access_method,
+                            success=True
+                        )
+                        
+                        # Return result
+                        return result.to_pandas() if to_pandas else result
+                except Exception as e:
+                    warnings.warn(f"Zero-copy access failed: {e}. Falling back to copy.")
+        
+        # Fall back to standard query
+        table_name = metadata['table_name']
+        
+        if use_arrow and self.arrow_available:
+            # Get as Arrow
+            arrow_result = self.conn.execute(f"SELECT * FROM {table_name}").fetch_arrow_table()
+            
+            # Log access
+            self.metadata_manager.log_access(
+                dataset_id=metadata['id'],
+                language="python",
+                operation="read",
+                access_method=access_method,
+                success=True
+            )
+            
+            return arrow_result.to_pandas() if to_pandas else arrow_result
+        else:
+            # Get as pandas
+            result = self.conn.execute(f"SELECT * FROM {table_name}").fetchdf()
+            
+            # Log access
+            self.metadata_manager.log_access(
+                dataset_id=metadata['id'],
+                language="python",
+                operation="read",
+                access_method=access_method,
+                success=True
+            )
+            
+            return result
+    
+    def _get_from_shared_memory(self, key):
+        """Get Arrow table from shared memory
+        
+        Args:
+            key: Shared memory key
+            
+        Returns:
+            Arrow Table or None if not found
+        """
+        try:
+            import pyarrow.plasma as plasma
+            
+            # Get object ID from database
+            result = self.conn.execute("""
+            SELECT object_id FROM crosslink_plasma_objects
+            WHERE key = ?
+            """, [key]).fetchone()
+            
+            if not result:
+                return None
+                
+            object_id = plasma.ObjectID.from_binary(bytes.fromhex(result[0]))
+            
+            # Connect to plasma store
+            plasma_client = plasma.connect("/tmp/plasma")
+            
+            # Get object
+            [data] = plasma_client.get([object_id])
+            
+            # Deserialize to Arrow table
+            reader = pa.RecordBatchFileReader(pa.BufferReader(data))
+            batches = [reader.get_record_batch(i) for i in range(reader.num_record_batches)]
+            table = pa.Table.from_batches(batches)
+            
+            return table
+        except ImportError:
+            warnings.warn("PyArrow plasma module not available. Shared memory access disabled.")
+            return None
+        except Exception as e:
+            warnings.warn(f"Failed to access data from shared memory: {e}")
+            return None
+    
+    def query(self, sql, use_arrow=True):
+        """Execute a SQL query on the CrossLink database
+        
+        Args:
+            sql: SQL query string
+            use_arrow: Use Arrow for data transfer if available
+            
+        Returns:
+            DataFrame or Arrow Table
+        """
+        if use_arrow and self.arrow_available:
+            return self.conn.execute(sql).fetch_arrow_table().to_pandas()
+        else:
+            return self.conn.execute(sql).fetchdf()
     
     def get_schema_history(self, identifier):
-        """
-        Get schema evolution history for a dataset.
+        """Get schema history for a dataset
         
         Args:
             identifier: Dataset ID or name
             
         Returns:
-            DataFrame containing schema history
+            DataFrame with schema history
         """
-        # First get the ID if name was provided
-        dataset_id = self.conn.execute("""
-        SELECT id FROM crosslink_metadata
-        WHERE id = ? OR name = ?
-        LIMIT 1
-        """, (identifier, identifier)).fetchone()
-        
-        if not dataset_id:
+        # Get dataset ID if name is provided
+        metadata = self.metadata_manager.get_dataset_metadata(identifier)
+        if not metadata:
             raise ValueError(f"Dataset with identifier '{identifier}' not found")
-        
-        dataset_id = dataset_id[0]
+            
+        dataset_id = metadata['id']
         
         result = self.conn.execute("""
-        SELECT id, version, schema, schema_hash, changed_at, change_type, changes
-        FROM crosslink_schema_history
+        SELECT * FROM crosslink_schema_history
         WHERE id = ?
-        ORDER BY version
-        """, (dataset_id,)).fetchall()
+        ORDER BY version DESC
+        """, [dataset_id]).fetchall()
         
         return pd.DataFrame(result, columns=[
             'id', 'version', 'schema', 'schema_hash', 'changed_at', 'change_type', 'changes'
         ])
     
-    def get_lineage(self, identifier):
-        """
-        Get data lineage information for a dataset.
-        
-        Args:
-            identifier: Dataset ID or name
-            
-        Returns:
-            DataFrame containing lineage information
-        """
-        # First get the ID if name was provided
-        dataset_id = self.conn.execute("""
-        SELECT id FROM crosslink_metadata
-        WHERE id = ? OR name = ?
-        LIMIT 1
-        """, (identifier, identifier)).fetchone()
-        
-        if not dataset_id:
-            raise ValueError(f"Dataset with identifier '{identifier}' not found")
-        
-        dataset_id = dataset_id[0]
-        
-        result = self.conn.execute("""
-        SELECT dataset_id, source_dataset_id, source_dataset_version, transformation, created_at
-        FROM crosslink_lineage
-        WHERE dataset_id = ?
-        """, (dataset_id,)).fetchall()
-        
-        return pd.DataFrame(result, columns=[
-            'dataset_id', 'source_dataset_id', 'source_dataset_version', 'transformation', 'created_at'
-        ])
-    
-    def push(self, df, name=None, description=None, use_arrow=True, sources=None, transformation=None, force_new_version=False,
-             chunk_size=None, use_disk_spilling=True):
-        """
-        Push a pandas DataFrame to the CrossLink registry.
-        
-        Args:
-            df: pandas DataFrame to share
-            name: Optional name for the dataset
-            description: Optional description of the dataset
-            use_arrow: Whether to use Arrow for storage (default: True)
-            sources: List of source dataset IDs or names that were used to create this dataset
-            transformation: Description of the transformation applied to create this dataset
-            force_new_version: Whether to create a new version even if schema hasn't changed
-            chunk_size: Size of chunks when handling large datasets (None = auto-detect based on data size)
-            use_disk_spilling: Whether to allow DuckDB to spill to disk for large datasets
-            
-        Returns:
-            dataset_id: The ID of the registered dataset
-        """
-        # Use the provided name or generate one
-        if name is None:
-            name = f"python_data_{int(time.time())}"
-            
-        # Check if dataset with this name already exists
-        existing = self.conn.execute("""
-        SELECT id, schema, version FROM crosslink_metadata 
-        WHERE name = ? AND current_version = TRUE
-        """, (name,)).fetchone()
-        
-        dataset_id = None
-        create_new_version = True
-        old_version = 1
-        
-        if existing:
-            dataset_id, old_schema, old_version = existing
-            
-            # Detect schema changes
-            schema_hash = self._compute_schema_hash(df)
-            schema_changes = self._detect_schema_changes(old_schema, df)
-            
-            # Only create new version if schema changed or forced
-            if schema_changes["change_type"] == "no_change" and not force_new_version:
-                create_new_version = False
-        else:
-            # New dataset
-            dataset_id = str(uuid.uuid4())
-            old_schema = None
-            schema_changes = {"change_type": "initial_schema"}
-        
-        # Generate unique table name for this version
-        new_version = old_version + 1 if create_new_version else old_version
-        table_name = f"crosslink_data_{dataset_id.replace('-', '_')}_{new_version}"
-        
-        # Calculate schema hash
-        schema_json = json.dumps({
-            'columns': list(df.columns),
-            'dtypes': {col: str(df[col].dtype) for col in df.columns},
-            'is_arrow': True if use_arrow and self.arrow_available else False
-        })
-        schema_hash = self._compute_schema_hash(df)
-        
-        # Enable disk spilling if requested
-        if use_disk_spilling:
-            try:
-                # Enable memory spilling to disk for large datasets
-                self.conn.execute("PRAGMA memory_limit='80%'")
-                self.conn.execute("PRAGMA threads=4")  # Adjust based on system capabilities
-                self.conn.execute("PRAGMA force_parallelism")
-            except Exception as e:
-                warnings.warn(f"Failed to configure DuckDB memory settings: {e}")
-        
-        # Determine if we should use chunking
-        use_chunking = False
-        estimated_size_bytes = df.memory_usage(deep=True).sum()
-        
-        if chunk_size is None:
-            # Auto-detect: if dataset is larger than 1GB, use chunking
-            use_chunking = estimated_size_bytes > 1_000_000_000  # 1GB
-            chunk_size = 500_000 if use_chunking else None  # Default chunk size of 500k rows
-        else:
-            use_chunking = chunk_size > 0
-        
-        # Store data using Arrow if possible, otherwise fall back to direct table creation
-        arrow_stored = False
-        
-        if use_arrow and self.arrow_available:
-            try:
-                if use_chunking:
-                    # Stream data in chunks to avoid memory issues
-                    # First create empty table with correct schema
-                    arrow_table_sample = pa.Table.from_pandas(df.head(1))
-                    self.conn.register("arrow_schema", arrow_table_sample)
-                    
-                    if create_new_version:
-                        # Create a new table with the schema
-                        self.conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM arrow_schema WHERE 1=0")
-                        self.conn.unregister("arrow_schema")
-                        
-                        # Insert data in chunks
-                        total_rows = len(df)
-                        for i in range(0, total_rows, chunk_size):
-                            chunk = df.iloc[i:min(i+chunk_size, total_rows)]
-                            arrow_chunk = pa.Table.from_pandas(chunk)
-                            self.conn.register("arrow_chunk", arrow_chunk)
-                            self.conn.execute(f"INSERT INTO {table_name} SELECT * FROM arrow_chunk")
-                            self.conn.unregister("arrow_chunk")
-                    else:
-                        # Update existing table
-                        old_table_name = f"crosslink_data_{dataset_id.replace('-', '_')}_{old_version}"
-                        self.conn.execute(f"DROP TABLE IF EXISTS {old_table_name}")
-                        self.conn.execute(f"CREATE TABLE {old_table_name} AS SELECT * FROM arrow_schema WHERE 1=0")
-                        self.conn.unregister("arrow_schema")
-                        
-                        # Insert data in chunks
-                        total_rows = len(df)
-                        for i in range(0, total_rows, chunk_size):
-                            chunk = df.iloc[i:min(i+chunk_size, total_rows)]
-                            arrow_chunk = pa.Table.from_pandas(chunk)
-                            self.conn.register("arrow_chunk", arrow_chunk)
-                            self.conn.execute(f"INSERT INTO {old_table_name} SELECT * FROM arrow_chunk")
-                            self.conn.unregister("arrow_chunk")
-                        table_name = old_table_name
-                else:
-                    # Non-chunked approach for smaller datasets
-                    arrow_table = pa.Table.from_pandas(df)
-                    
-                    if create_new_version:
-                        # Create a new table for the new version
-                        self.conn.register("arrow_table", arrow_table)
-                        self.conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM arrow_table")
-                        self.conn.unregister("arrow_table")
-                    else:
-                        # Update existing table
-                        old_table_name = f"crosslink_data_{dataset_id.replace('-', '_')}_{old_version}"
-                        self.conn.execute(f"DROP TABLE IF EXISTS {old_table_name}")
-                        self.conn.register("arrow_table", arrow_table)
-                        self.conn.execute(f"CREATE TABLE {old_table_name} AS SELECT * FROM arrow_table")
-                        self.conn.unregister("arrow_table")
-                        table_name = old_table_name
-                
-                # Mark as successfully stored using Arrow
-                arrow_stored = True
-            except Exception as e:
-                warnings.warn(f"Failed to use Arrow for data storage: {e}")
-                warnings.warn("Falling back to direct DuckDB table creation")
-                arrow_stored = False
-        
-        if not arrow_stored:
-            # Direct table creation without Arrow
-            try:
-                if use_chunking:
-                    # Create empty table with schema
-                    if create_new_version:
-                        self.conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM df WHERE 1=0", {"df": df.head(1)})
-                        
-                        # Insert data in chunks
-                        total_rows = len(df)
-                        for i in range(0, total_rows, chunk_size):
-                            chunk = df.iloc[i:min(i+chunk_size, total_rows)]
-                            self.conn.execute(f"INSERT INTO {table_name} SELECT * FROM chunk", {"chunk": chunk})
-                    else:
-                        # Update existing table
-                        old_table_name = f"crosslink_data_{dataset_id.replace('-', '_')}_{old_version}"
-                        self.conn.execute(f"DROP TABLE IF EXISTS {old_table_name}")
-                        self.conn.execute(f"CREATE TABLE {old_table_name} AS SELECT * FROM df WHERE 1=0", {"df": df.head(1)})
-                        
-                        # Insert data in chunks
-                        total_rows = len(df)
-                        for i in range(0, total_rows, chunk_size):
-                            chunk = df.iloc[i:min(i+chunk_size, total_rows)]
-                            self.conn.execute(f"INSERT INTO {old_table_name} SELECT * FROM chunk", {"chunk": chunk})
-                        table_name = old_table_name
-                else:
-                    # Non-chunked approach for smaller datasets
-                    if create_new_version:
-                        self.conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM df", {"df": df})
-                    else:
-                        old_table_name = f"crosslink_data_{dataset_id.replace('-', '_')}_{old_version}"
-                        self.conn.execute(f"DROP TABLE IF EXISTS {old_table_name}")
-                        self.conn.execute(f"CREATE TABLE {old_table_name} AS SELECT * FROM df", {"df": df})
-                        table_name = old_table_name
-            except Exception as e:
-                # If we still have memory issues, try with a smaller chunk size
-                if not use_chunking or chunk_size > 10000:
-                    smaller_chunk = 10000 if not use_chunking else chunk_size // 2
-                    warnings.warn(f"Retrying with smaller chunk size ({smaller_chunk})")
-                    return self.push(df, name, description, use_arrow, sources, transformation, 
-                                   force_new_version, smaller_chunk, use_disk_spilling)
-                else:
-                    raise e
-        
-        # If creating a new version, mark old versions as not current
-        if create_new_version and existing:
-            self.conn.execute("""
-            UPDATE crosslink_metadata SET current_version = FALSE
-            WHERE id = ?
-            """, (dataset_id,))
-            
-            # Record schema history
-            self.conn.execute("""
-            INSERT INTO crosslink_schema_history 
-            (id, version, schema, schema_hash, changed_at, change_type, changes)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
-            """, (
-                dataset_id, 
-                new_version, 
-                schema_json, 
-                schema_hash, 
-                schema_changes["change_type"], 
-                json.dumps(schema_changes.get("changes", {}))
-            ))
-        
-        # Record lineage information
-        if sources and create_new_version:
-            if not isinstance(sources, list):
-                sources = [sources]
-                
-            for source in sources:
-                # Get source dataset ID and version
-                source_metadata = self.conn.execute("""
-                SELECT id, version FROM crosslink_metadata 
-                WHERE (id = ? OR name = ?) AND current_version = TRUE
-                """, (source, source)).fetchone()
-                
-                if source_metadata:
-                    source_id, source_version = source_metadata
-                    
-                    # Record lineage
-                    self.conn.execute("""
-                    INSERT OR REPLACE INTO crosslink_lineage
-                    (dataset_id, source_dataset_id, source_dataset_version, transformation, created_at)
-                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    """, (dataset_id, source_id, source_version, transformation or "unknown"))
-        
-        # Insert or update metadata
-        if create_new_version:
-            # Insert new metadata record
-            self.conn.execute("""
-            INSERT INTO crosslink_metadata 
-            (id, name, source_language, created_at, updated_at, description, schema, table_name, arrow_data, version, current_version, schema_hash)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, TRUE, ?)
-            """, (
-                dataset_id, name, "python", description, schema_json, table_name, arrow_stored, new_version, schema_hash
-            ))
-        else:
-            # Update existing metadata record
-            self.conn.execute("""
-            UPDATE crosslink_metadata SET
-            updated_at = CURRENT_TIMESTAMP,
-            description = COALESCE(?, description),
-            arrow_data = ?
-            WHERE id = ? AND version = ?
-            """, (description, arrow_stored, dataset_id, old_version))
-        
-        return dataset_id
-    
-    def pull(self, identifier, to_pandas=True, use_arrow=True, version=None, chunk_size=None, 
-             stream=False, use_disk_spilling=True):
-        """
-        Pull a dataset from the CrossLink registry.
-        
-        Args:
-            identifier: Dataset ID or name
-            to_pandas: Whether to return as pandas DataFrame (default: True)
-            use_arrow: Whether to use Arrow for data retrieval when available (default: True)
-            version: Specific version to retrieve (default: latest version)
-            chunk_size: Size of chunks when retrieving large datasets (only used when stream=True)
-            stream: Whether to return an iterator over chunks instead of the full dataset
-            use_disk_spilling: Whether to allow DuckDB to spill to disk for large operations
-            
-        Returns:
-            If stream=False (default): DataFrame or Arrow Table with the dataset
-            If stream=True: Iterator over DataFrame or Arrow Table chunks
-        """
-        # Enable disk spilling if requested
-        if use_disk_spilling:
-            try:
-                # Enable memory spilling to disk for large datasets
-                self.conn.execute("PRAGMA memory_limit='80%'")
-                self.conn.execute("PRAGMA threads=4")  # Adjust based on system capabilities
-                self.conn.execute("PRAGMA force_parallelism")
-            except Exception as e:
-                warnings.warn(f"Failed to configure DuckDB memory settings: {e}")
-        
-        # Try to find by ID/name with version condition
-        version_condition = ""
-        params = [identifier, identifier]
-        
-        if version is not None:
-            version_condition = "AND version = ?"
-            params.append(version)
-        else:
-            version_condition = "AND current_version = TRUE"
-        
-        query = f"""
-        SELECT table_name, schema, arrow_data, 
-               (SELECT COUNT(*) FROM crosslink_metadata cm 
-                WHERE (id = ? OR name = ?) {version_condition}) as row_count
-        FROM crosslink_metadata 
-        WHERE (id = ? OR name = ?) {version_condition}
-        """
-        
-        metadata = self.conn.execute(query, [identifier, identifier] + params).fetchone()
-        
-        if not metadata:
-            raise ValueError(f"Dataset with identifier '{identifier}' and specified version not found")
-        
-        table_name, schema_json, arrow_data, dataset_size = metadata
-        
-        # Parse schema to check if it's Arrow data
-        schema = None
-        if schema_json:
-            schema = json.loads(schema_json)
-        else:
-            schema = {}
-        
-        is_arrow = schema.get('is_arrow', False) or arrow_data
-        
-        # Get row count to determine if we should use chunking
-        row_count_query = f"SELECT COUNT(*) FROM {table_name}"
-        row_count = self.conn.execute(row_count_query).fetchone()[0]
-        
-        # Auto-determine chunk size if not specified and streaming
-        if stream and chunk_size is None:
-            # Default chunk size: 100k rows for regular tables, 10k rows for wide tables
-            col_count = len(schema.get('columns', []))
-            if col_count > 100:  # Wide table
-                chunk_size = 10000
-            else:
-                chunk_size = 100000
-        
-        # Define a generator for streaming data
-        def data_stream_generator():
-            # Calculate number of chunks
-            num_chunks = (row_count + chunk_size - 1) // chunk_size
-            
-            for chunk_idx in range(num_chunks):
-                offset = chunk_idx * chunk_size
-                limit = chunk_size
-                
-                # Query for this chunk
-                chunk_query = f"SELECT * FROM {table_name} LIMIT {limit} OFFSET {offset}"
-                
-                # Use Arrow for retrieval if available and requested
-                if use_arrow and self.arrow_available and is_arrow:
-                    chunk_result = self.conn.execute(chunk_query).arrow()
-                    
-                    if to_pandas:
-                        # Convert to pandas DataFrame
-                        yield chunk_result.to_pandas()
-                    else:
-                        # Return as Arrow Table
-                        yield chunk_result
-                else:
-                    # Standard DuckDB retrieval
-                    chunk_result = self.conn.execute(chunk_query).fetchdf()
-                    
-                    if not to_pandas and self.arrow_available:
-                        # Convert to Arrow Table if requested
-                        yield pa.Table.from_pandas(chunk_result)
-                    else:
-                        # Return as pandas DataFrame
-                        yield chunk_result
-        
-        # Return a streaming iterator if requested
-        if stream:
-            return data_stream_generator()
-        
-        # For non-streaming mode, we still use chunking internally for large datasets
-        if row_count > 1_000_000:  # For datasets with more than 1M rows
-            # Use chunking internally for memory efficiency
-            internal_chunk_size = 500_000  # 500k rows per chunk
-            
-            # Decide on container based on output type
-            if to_pandas:
-                all_chunks = []
-                
-                # Stream data in chunks
-                for i in range(0, row_count, internal_chunk_size):
-                    chunk_query = f"SELECT * FROM {table_name} LIMIT {internal_chunk_size} OFFSET {i}"
-                    if use_arrow and self.arrow_available:
-                        chunk = self.conn.execute(chunk_query).arrow().to_pandas()
-                    else:
-                        chunk = self.conn.execute(chunk_query).fetchdf()
-                    all_chunks.append(chunk)
-                
-                # Combine all chunks
-                if all_chunks:
-                    return pd.concat(all_chunks, ignore_index=True)
-                return pd.DataFrame()
-            else:
-                # For Arrow tables, we'll collect RecordBatches
-                batches = []
-                
-                # Stream data in chunks
-                for i in range(0, row_count, internal_chunk_size):
-                    chunk_query = f"SELECT * FROM {table_name} LIMIT {internal_chunk_size} OFFSET {i}"
-                    if use_arrow and self.arrow_available:
-                        chunk = self.conn.execute(chunk_query).arrow()
-                    else:
-                        chunk = pa.Table.from_pandas(self.conn.execute(chunk_query).fetchdf())
-                    
-                    # Add all record batches
-                    for batch in chunk.to_batches():
-                        batches.append(batch)
-                
-                # Combine all batches
-                if batches:
-                    return pa.Table.from_batches(batches)
-                return pa.Table.from_arrays([], [])
-        
-        # Standard retrieval for smaller datasets
-        query = f"SELECT * FROM {table_name}"
-        
-        # Use Arrow for retrieval if available and requested
-        if use_arrow and self.arrow_available and is_arrow:
-            result = self.conn.execute(query).arrow()
-            
-            if to_pandas:
-                # Convert to pandas DataFrame
-                return result.to_pandas()
-            else:
-                # Return as Arrow Table
-                return result
-        else:
-            # Standard DuckDB retrieval
-            result = self.conn.execute(query).fetchdf()
-            
-            if not to_pandas and self.arrow_available:
-                # Convert to Arrow Table if requested
-                return pa.Table.from_pandas(result)
-            else:
-                # Return as pandas DataFrame
-                return result
-    
-    def delete(self, identifier, version=None):
-        """
-        Delete a dataset from the CrossLink registry.
-        
-        Args:
-            identifier: Dataset ID or name
-            version: Specific version to delete (default: all versions)
-        """
-        # Get metadata for the dataset
-        version_condition = ""
-        params = [identifier, identifier]
-        
-        if version is not None:
-            version_condition = "AND version = ?"
-            params.append(version)
-        
-        metadata_results = self.conn.execute(f"""
-        SELECT id, table_name, version FROM crosslink_metadata 
-        WHERE (id = ? OR name = ?) {version_condition}
-        """, params).fetchall()
-        
-        if not metadata_results:
-            raise ValueError(f"Dataset with identifier '{identifier}' not found")
-        
-        dataset_id = metadata_results[0][0]
-        
-        for _, table_name, version in metadata_results:
-            # Delete the data table
-            self.conn.execute(f"DROP TABLE IF EXISTS {table_name}")
-            
-            # Delete schema history
-            self.conn.execute("""
-            DELETE FROM crosslink_schema_history WHERE id = ? AND version = ?
-            """, (dataset_id, version))
-            
-            # Delete the metadata
-            self.conn.execute("""
-            DELETE FROM crosslink_metadata WHERE id = ? AND version = ?
-            """, (dataset_id, version))
-        
-        # If deleting all versions, also clean up lineage
-        if version is None:
-            self.conn.execute("""
-            DELETE FROM crosslink_lineage WHERE dataset_id = ? OR source_dataset_id = ?
-            """, (dataset_id, dataset_id))
-    
-    def check_compatibility(self, source_id, target_id):
-        """
-        Check if two datasets have compatible schemas.
-        
-        Args:
-            source_id: Source dataset ID or name
-            target_id: Target dataset ID or name
-            
-        Returns:
-            dict: Compatibility information
-        """
-        source_metadata = self.conn.execute("""
-        SELECT schema FROM crosslink_metadata 
-        WHERE (id = ? OR name = ?) AND current_version = TRUE
-        """, (source_id, source_id)).fetchone()
-        
-        target_metadata = self.conn.execute("""
-        SELECT schema FROM crosslink_metadata 
-        WHERE (id = ? OR name = ?) AND current_version = TRUE
-        """, (target_id, target_id)).fetchone()
-        
-        if not source_metadata or not target_metadata:
-            missing = []
-            if not source_metadata:
-                missing.append(f"Source dataset '{source_id}' not found")
-            if not target_metadata:
-                missing.append(f"Target dataset '{target_id}' not found")
-            return {"compatible": False, "reason": "; ".join(missing)}
-        
-        source_schema = json.loads(source_metadata[0])
-        target_schema = json.loads(target_metadata[0])
-        
-        source_cols = set(source_schema.get('columns', []))
-        target_cols = set(target_schema.get('columns', []))
-        
-        missing_cols = source_cols - target_cols
-        if missing_cols:
-            return {
-                "compatible": False,
-                "reason": f"Target schema missing columns: {', '.join(missing_cols)}"
-            }
-        
-        common_cols = source_cols.intersection(target_cols)
-        source_dtypes = source_schema.get('dtypes', {})
-        target_dtypes = target_schema.get('dtypes', {})
-        
-        dtype_mismatches = []
-        for col in common_cols:
-            source_type = source_dtypes.get(col)
-            target_type = target_dtypes.get(col)
-            if source_type != target_type:
-                dtype_mismatches.append(f"{col}: {source_type} vs {target_type}")
-        
-        if dtype_mismatches:
-            return {
-                "compatible": False,
-                "reason": f"Type mismatches: {'; '.join(dtype_mismatches)}"
-            }
-        
-        return {"compatible": True}
-    
     def close(self):
-        """Close the connection to the database."""
+        """Close the database connection."""
         self.conn.close()
-    
+        
     def __enter__(self):
+        """Context manager entry."""
         return self
-    
+        
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
         self.close()
-
-    def monitor_resources(self, active=True):
-        """
-        Enable or disable resource monitoring for CrossLink operations.
+    
+    def get_table_reference(self, identifier):
+        """Get a direct reference to a table without copying data
+        
+        This method returns information needed to directly access the table
+        in the DuckDB database from any language, enabling true zero-copy access.
         
         Args:
-            active: Whether to enable resource monitoring
+            identifier: Dataset ID or name
             
         Returns:
-            None
+            Dict with database_path, table_name, and schema information
         """
+        # Get metadata
+        metadata = self.metadata_manager.get_dataset_metadata(identifier)
+        if not metadata:
+            raise ValueError(f"Dataset with identifier '{identifier}' not found")
+        
+        # Log the access as zero-copy
+        self.metadata_manager.log_access(
+            dataset_id=metadata['id'],
+            language="python",
+            operation="reference",
+            access_method="zero-copy",
+            success=True
+        )
+        
+        # Return the information needed to access the table directly
+        return {
+            "database_path": os.path.abspath(self.db_path),
+            "table_name": metadata['table_name'],
+            "schema": metadata['schema'],
+            "arrow_schema": metadata.get('arrow_schema'),
+            "dataset_id": metadata['id'],
+            "access_method": "direct_table_reference"
+        }
+        
+    def register_external_table(self, external_db_path, external_table_name, name=None, description=None):
+        """Register an external table from another DuckDB database without copying data
+        
+        This method creates a reference to a table in another DuckDB database
+        without copying the data, enabling true zero-copy access across connections.
+        
+        Args:
+            external_db_path: Path to the external DuckDB database
+            external_table_name: Name of the table in the external database
+            name: Name for the dataset (will be auto-generated if None)
+            description: Optional description
+            
+        Returns:
+            dataset_id: ID of the registered reference
+        """
+        # Generate dataset ID and name if not provided
+        dataset_id = str(uuid.uuid4())
+        if name is None:
+            name = f"ext_{os.path.basename(external_db_path)}_{external_table_name}"
+        
+        # Use DuckDB's attach feature to access the external database
+        external_db_path = os.path.abspath(external_db_path)
+        attach_name = f"ext_{dataset_id.replace('-', '_')}"
+        
         try:
-            import psutil
-            self._has_psutil = True
-        except ImportError:
-            warnings.warn("psutil is not installed. Resource monitoring will be limited.")
-            self._has_psutil = False
-        
-        self._resource_monitoring = active
-        
-        if active:
-            # Initialize resource monitoring
-            self._resource_data = {
-                'timestamps': [],
-                'memory_usage': [],
-                'disk_reads': [],
-                'disk_writes': [],
-                'cpu_percent': []
+            # Check if the external database is the same as our current database
+            current_db_path = os.path.abspath(self.db_path)
+            same_database = (current_db_path == external_db_path)
+            
+            # If it's not the same database, attach it
+            if not same_database:
+                try:
+                    # Attach the external database
+                    self.conn.execute(f"ATTACH DATABASE '{external_db_path}' AS {attach_name}")
+                    external_schema_prefix = f"{attach_name}."
+                except Exception as e:
+                    # Check if error is about database already being attached
+                    if "already attached" in str(e):
+                        # Get the existing attachment name by querying pragma_database_list
+                        result = self.conn.execute("SELECT name FROM pragma_database_list() WHERE file = ?", 
+                                              [external_db_path]).fetchone()
+                        if result:
+                            attach_name = result[0]
+                            external_schema_prefix = f"{attach_name}."
+                        else:
+                            # Can't find attachment, use main
+                            external_schema_prefix = ""
+                    else:
+                        # Some other error occurred
+                        raise e
+            else:
+                # Same database, don't need prefix
+                external_schema_prefix = ""
+            
+            # Get schema information from the external table
+            schema_df = self.conn.execute(f"DESCRIBE {external_schema_prefix}{external_table_name}").fetchdf()
+            
+            # Create a schema dictionary
+            schema_dict = {
+                'columns': schema_df['column_name'].tolist(),
+                'dtypes': {row['column_name']: row['column_type'] for _, row in schema_df.iterrows()}
             }
             
-            # Start monitoring thread if psutil is available
-            if self._has_psutil:
-                import threading
-                import time
-                
-                def monitor_loop():
-                    process = psutil.Process()
-                    disk_io_start = psutil.disk_io_counters()
-                    
-                    while self._resource_monitoring:
-                        try:
-                            # Collect data
-                            mem_info = process.memory_info()
-                            cpu_percent = process.cpu_percent()
-                            disk_io_current = psutil.disk_io_counters()
-                            
-                            # Calculate disk I/O deltas
-                            read_delta = disk_io_current.read_bytes - disk_io_start.read_bytes
-                            write_delta = disk_io_current.write_bytes - disk_io_start.write_bytes
-                            
-                            # Update disk I/O baseline
-                            disk_io_start = disk_io_current
-                            
-                            # Record data
-                            self._resource_data['timestamps'].append(time.time())
-                            self._resource_data['memory_usage'].append(mem_info.rss)
-                            self._resource_data['disk_reads'].append(read_delta)
-                            self._resource_data['disk_writes'].append(write_delta)
-                            self._resource_data['cpu_percent'].append(cpu_percent)
-                            
-                            # Sleep for a short interval
-                            time.sleep(0.5)
-                        except Exception as e:
-                            warnings.warn(f"Error in resource monitoring: {e}")
-                            time.sleep(1)
-                
-                # Start monitoring in a separate thread
-                self._monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-                self._monitor_thread.start()
-        else:
-            # Stop monitoring
-            self._resource_monitoring = False
-            self._resource_data = None
-
-    def get_resource_stats(self):
-        """
-        Get resource usage statistics for CrossLink operations.
-        
-        Returns:
-            DataFrame with resource usage data if monitoring is active,
-            None otherwise
-        """
-        if not hasattr(self, '_resource_monitoring') or not self._resource_monitoring:
-            warnings.warn("Resource monitoring is not enabled. Call monitor_resources(True) to enable it.")
-            return None
-        
-        if not self._resource_data or len(self._resource_data['timestamps']) == 0:
-            return pd.DataFrame()
-        
-        # Convert to DataFrame
-        df = pd.DataFrame({
-            'timestamp': self._resource_data['timestamps'],
-            'memory_mb': [m / (1024 * 1024) for m in self._resource_data['memory_usage']],
-            'disk_reads_mb': [r / (1024 * 1024) for r in self._resource_data['disk_reads']],
-            'disk_writes_mb': [w / (1024 * 1024) for w in self._resource_data['disk_writes']],
-            'cpu_percent': self._resource_data['cpu_percent']
-        })
-        
-        # Calculate summary statistics
-        summary = pd.DataFrame({
-            'metric': ['memory_mb', 'disk_reads_mb', 'disk_writes_mb', 'cpu_percent'],
-            'mean': [df['memory_mb'].mean(), df['disk_reads_mb'].mean(), 
-                    df['disk_writes_mb'].mean(), df['cpu_percent'].mean()],
-            'max': [df['memory_mb'].max(), df['disk_reads_mb'].max(), 
-                   df['disk_writes_mb'].max(), df['cpu_percent'].max()],
-            'total': [None, df['disk_reads_mb'].sum(), df['disk_writes_mb'].sum(), None]
-        })
-        
-        # Get DuckDB stats if available
-        try:
-            duckdb_stats = self.conn.execute("PRAGMA database_size").fetchdf()
-            self._resource_data['duckdb_stats'] = duckdb_stats
+            # Create a view to the external table
+            view_name = f"ext_view_{dataset_id.replace('-', '_')}"
+            self.conn.execute(f"CREATE VIEW {view_name} AS SELECT * FROM {external_schema_prefix}{external_table_name}")
+            
+            # Store metadata about this reference
+            self.metadata_manager.create_dataset_metadata(
+                dataset_id=dataset_id,
+                name=name,
+                table_name=view_name,
+                source_language="external",
+                schema=schema_dict,
+                description=description or f"External table reference to {external_db_path}:{external_table_name}",
+                arrow_data=False,
+                memory_map_path=None,
+                shared_memory_key=None,
+                arrow_schema=None,
+                access_languages=["python", "r", "julia", "cpp"],
+                memory_layout=None
+            )
+            
+            # Log the operation
+            self.metadata_manager.log_access(
+                dataset_id=dataset_id,
+                language="python",
+                operation="reference",
+                access_method="external_table",
+                success=True
+            )
+            
+            return dataset_id
+            
         except Exception as e:
-            warnings.warn(f"Failed to get DuckDB database stats: {e}")
-        
-        return {
-            'time_series': df,
-            'summary': summary,
-            'duckdb_stats': self._resource_data.get('duckdb_stats')
-        }
+            warnings.warn(f"Failed to register external table: {e}")
+            # Detach the database if it was attached and isn't the same as current
+            if 'same_database' in locals() and not same_database and 'attach_name' in locals():
+                try:
+                    self.conn.execute(f"DETACH DATABASE {attach_name}")
+                except:
+                    pass
+            
+            raise e

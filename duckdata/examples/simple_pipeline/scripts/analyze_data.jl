@@ -1,53 +1,20 @@
 """
 Analyze data for the PipeLink example pipeline.
 
-This is the fourth node in the pipeline that analyzes the enhanced data from the Rust node.
+This is the third node in the pipeline that analyzes the transformed data
+using CrossLink for zero-copy data sharing.
 """
-
-# Try to import the PipeLink package, or load modules directly if not installed
-try
-    # Try to import the installed package
-    using PipeLink
-catch e
-    println("Failed to import PipeLink package, trying to load modules directly...")
-    
-    # Try different paths to find the modules
-    script_dir = dirname(@__FILE__)
-    paths = [
-        joinpath(script_dir, "..", "..", "..", "jl-pipelink", "src", "CrossLink.jl"),
-        joinpath(script_dir, "..", "..", "..", "jl-pipelink", "src", "PipeLinkNode.jl"),
-        joinpath(script_dir, "..", "..", "..", "pipelink", "julia", "crosslink.jl"),
-        joinpath(script_dir, "..", "..", "..", "pipelink", "julia", "pipelink_node.jl")
-    ]
-    
-    module_loaded = false
-    for path in paths
-        if isfile(path)
-            println("Including file: $path")
-            include(path)
-            module_loaded = true
-            
-            # If we find CrossLink.jl, we need to make it available to PipeLinkNode
-            if occursin("CrossLink.jl", path)
-                # Create global CrossLink module
-                global CrossLink = Main.CrossLink
-            elseif occursin("PipeLinkNode.jl", path) || occursin("pipelink_node.jl", path)
-                # Import from PipeLinkNode
-                global NodeContext = Main.PipeLinkNode.NodeContext
-                global get_input = Main.PipeLinkNode.get_input
-                global save_output = Main.PipeLinkNode.save_output
-                global get_param = Main.PipeLinkNode.get_param
-            end
-        end
-    end
-    
-    if !module_loaded
-        error("Could not find PipeLink modules to include directly. Please install the PipeLink Julia package.")
-    end
-end
 
 using Statistics
 using DataFrames
+using JSON
+using Dates
+
+# Import CrossLink
+include(joinpath(dirname(Base.find_package("DuckDB")), "..", "..", "..", "pipelink", "crosslink", "julia", "crosslink.jl"))
+using .CrossLink
+
+println("Starting analyze_data.jl")
 
 """
     analyze_data(data, detailed=false)
@@ -62,55 +29,16 @@ function analyze_data(data, detailed=false)
     numeric_cols = filter(col -> eltype(data[!, col]) <: Number, names(data))
     
     for col in numeric_cols
-        col_stats = Dict{String, Any}(
-            "mean" => mean(data[!, col]),
-            "median" => median(data[!, col]),
-            "std" => std(data[!, col]),
-            "min" => minimum(data[!, col]),
-            "max" => maximum(data[!, col])
-        )
-        
-        if detailed
-            col_stats["quantiles"] = quantile(data[!, col], [0.25, 0.75])
-        end
-        
-        stats[string(col)] = col_stats
-    end
-    
-    # Categorical analysis
-    categorical_cols = ["category"]
-    if "classification" in names(data)
-        push!(categorical_cols, "classification")
-    end
-    
-    for cat_col in categorical_cols
-        if cat_col in names(data)
-            category_counts = combine(groupby(data, Symbol(cat_col)), nrow => :count)
-            stats["$(cat_col)_counts"] = category_counts
-        end
-    end
-    
-    # Correlation matrix for numeric columns
-    if detailed && length(numeric_cols) > 1
-        corr_matrix = cor(Matrix(data[!, numeric_cols]))
-        stats["correlation_matrix"] = Dict(
-            "columns" => numeric_cols,
-            "values" => corr_matrix
-        )
-    end
-    
-    # Special analysis for Rust-added columns if they exist
-    rust_cols = ["squared_value", "cube_value"]
-    existing_rust_cols = filter(col -> col in names(data), rust_cols)
-    
-    if !isempty(existing_rust_cols)
-        stats["rust_columns_present"] = join(existing_rust_cols, ", ")
-        
-        # Compare original values with transformed ones
-        if "value" in names(data) && "squared_value" in names(data)
-            # Check how many values are > 1 where squaring increases the magnitude
-            increased_by_square = sum(abs.(data.squared_value) .> abs.(data.value))
-            stats["values_increased_by_squaring"] = increased_by_square
+        if col != "id"  # Skip id column
+            col_stats = Dict{String, Any}(
+                "mean" => mean(data[!, col]),
+                "median" => median(data[!, col]),
+                "std" => std(data[!, col]),
+                "min" => minimum(data[!, col]),
+                "max" => maximum(data[!, col])
+            )
+            
+            stats[string(col)] = col_stats
         end
     end
     
@@ -118,40 +46,62 @@ function analyze_data(data, detailed=false)
     result_rows = []
     
     for (key, value) in stats
-        if value isa AbstractDataFrame
-            push!(result_rows, (statistic = "$(key)_dataframe", value = string(value)))
-        elseif value isa Dict
+        if value isa Dict
             for (subkey, subvalue) in value
-                push!(result_rows, (statistic = "$(key)_$(subkey)", value = string(subvalue)))
+                push!(result_rows, (metric = "$(key)_$(subkey)", value = subvalue))
             end
         else
-            push!(result_rows, (statistic = key, value = string(value)))
+            push!(result_rows, (metric = key, value = value))
         end
     end
     
     return DataFrame(result_rows)
 end
 
+# Main function to process node
 function main()
-    ctx = NodeContext()
-    try
-        # Get input data
-        data = get_input(ctx, "transformed_data", true, false)
-        
-        # Get parameters
-        detailed = get_param(ctx, "detailed", true)
-        
-        # Analyze data
-        result = analyze_data(data, detailed)
-        
-        # Save output
-        save_output(ctx, "analysis_results", result, "Statistical analysis of the enhanced data from the Rust node")
-        
-        println("Analysis complete with $(nrow(result)) statistics calculated")
-    finally
-        close(ctx)
+    # Check command line arguments
+    if length(ARGS) < 1
+        error("No metadata file provided. This script should be run by PipeLink.")
     end
+    
+    # Load metadata from file
+    meta_path = ARGS[1]
+    println("Using metadata file: $meta_path")
+    
+    # Parse the metadata file to extract db_path
+    meta_content = read(meta_path, String)
+    db_path_line = match(r"db_path:\s*(.+)", meta_content)
+    db_path = String(strip(db_path_line.captures[1]))
+    println("Using db_path: $db_path")
+    
+    # Initialize CrossLink manager with the database
+    println("Initializing CrossLink with database: $db_path")
+    manager = CrossLinkManager(db_path)
+    
+    # Get transformed data using true zero-copy
+    println("Getting transformed data via CrossLink (zero-copy)...")
+    transformed_data = pull_data(manager, "transformed_data", zero_copy=true)
+    println("Loaded data via zero-copy: $(nrow(transformed_data)) rows, columns: $(join(names(transformed_data), ", "))")
+    
+    # Analyze the data
+    println("Analyzing data...")
+    result = analyze_data(transformed_data)
+    println("Analysis complete with $(nrow(result)) statistics calculated")
+    
+    # Use push_data with our result
+    println("Saving analysis results with CrossLink...")
+    dataset_id = push_data(
+        manager, 
+        result, 
+        "analysis_results",
+        description="Statistical analysis of the transformed data",
+        arrow_data=true
+    )
+    
+    println("Analysis results shared via CrossLink with ID: $dataset_id")
 end
 
 # Run the main function
-main() 
+main()
+println("analyze_data.jl completed") 

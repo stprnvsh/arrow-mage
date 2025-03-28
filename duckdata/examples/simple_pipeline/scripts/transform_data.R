@@ -1,83 +1,107 @@
 #' Transform data for the PipeLink example pipeline.
 #'
-#' This is the second node in the pipeline that transforms the raw data.
+#' This is the second node in the pipeline that transforms the raw data
+#' using zero-copy data sharing directly with DuckDB.
 
-# Try to load PipeLink library
-tryCatch({
-  library(pipelink)
-}, error = function(e) {
-  # Try to source the R files directly
-  cat("Failed to load pipelink R package, trying to source files directly...\n")
-  
-  # Get script directory and try to find the source files
-  current_script <- commandArgs(trailingOnly = FALSE)
-  script_path <- dirname(sub("--file=", "", current_script[grep("--file=", current_script)]))
-  
-  # Try various relative paths
-  source_paths <- c(
-    file.path(script_path, "..", "..", "..", "r-pipelink", "R", "crosslink.R"),
-    file.path(script_path, "..", "..", "..", "pipelink", "r", "pipelink_node.R"),
-    file.path(script_path, "..", "..", "..", "pipelink", "r", "crosslink.R")
-  )
-  
-  crosslink_loaded <- FALSE
-  for (path in source_paths) {
-    if (file.exists(path)) {
-      cat("Sourcing file:", path, "\n")
-      source(path)
-      crosslink_loaded <- TRUE
-      break
-    }
+# Load required libraries
+library(DBI)
+library(duckdb)
+library(uuid)
+library(jsonlite)
+library(digest)
+
+# Main function for zero-copy processing
+process_data <- function() {
+  # Get the metadata file path from command line args
+  args <- commandArgs(trailingOnly = TRUE)
+  if (length(args) < 1) {
+    stop("No metadata file provided. This script should be run by PipeLink.")
   }
   
-  if (!crosslink_loaded) {
-    stop("Could not find CrossLink files to source directly. Please install the pipelink R package.")
-  }
-})
-
-# Create very simple context manually
-ctx <- new.env()
-
-# Create a simplified get_input function
-ctx$get_input <- function(name) {
-  cat("Manual data creation instead of loading from previous node\n")
-  # Create a simple data frame manually
-  data.frame(
-    id = 1:10,
-    value = c(1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5),
-    category = c("A", "B", "A", "B", "A", "B", "A", "B", "A", "B")
-  )
-}
-
-# Create a simplified save_output function
-ctx$save_output <- function(name, data, description) {
-  cat("Saving output data:", name, "\n")
-  cat("Data dimensions:", nrow(data), "rows x", ncol(data), "columns\n")
-  cat("Column names:", paste(names(data), collapse=", "), "\n")
-  cat("Output saved successfully\n")
-}
-
-# Main function to process data
-process_data <- function(ctx) {
-  # Get input data
-  cat("Getting input data\n")
-  data <- ctx$get_input("raw_data")
+  # Read metadata file
+  meta_path <- args[1]
+  cat("Using metadata file:", meta_path, "\n")
   
-  # Debug output
+  # Extract database path from metadata
+  meta_content <- readLines(meta_path)
+  db_path_line <- grep("db_path:", meta_content, value = TRUE)
+  db_path <- sub("db_path:\\s*", "", db_path_line)
+  cat("Using db_path:", db_path, "\n")
+  
+  # Connect directly to the database for zero-copy access
+  con <- dbConnect(duckdb(), db_path)
+  
+  # Find raw_data table 
+  all_tables <- dbGetQuery(con, "SHOW TABLES")
+  cat("Available tables:\n")
+  print(all_tables)
+  
+  # Find the raw_data table
+  raw_data_table <- all_tables[grep("raw_data", all_tables$name), "name"]
+  cat("Raw data table:", raw_data_table, "\n")
+  
+  # Query the data directly - zero copy
+  query <- paste0("SELECT * FROM ", raw_data_table)
+  data <- dbGetQuery(con, query)
+  
   cat("Data received - dimensions:", nrow(data), "rows x", ncol(data), "columns\n")
   cat("Column names:", paste(names(data), collapse=", "), "\n")
   
-  # Only perform minimal transformations
+  # Perform transformations
   transformed_data <- data
   
-  # Add a single simple column
+  # Add new features
   transformed_data$abs_value <- abs(transformed_data$value)
+  transformed_data$log_value <- log(abs(transformed_data$value) + 1)
+  transformed_data$scaled_value <- transformed_data$value / max(abs(transformed_data$value))
+  transformed_data$category_code <- as.integer(as.factor(transformed_data$category))
   
-  # Save output (using simplified functions)
-  ctx$save_output("transformed_data", transformed_data, "Minimally transformed data")
+  # Create a table for the transformed data
+  result_table_name <- "data_transformed_data"
   
-  cat("Transformation complete\n")
+  # Register and create the transformed data table
+  dbWriteTable(con, "temp_transformed", transformed_data, overwrite = TRUE)
+  dbExecute(con, paste0("CREATE OR REPLACE TABLE ", result_table_name, " AS SELECT * FROM temp_transformed"))
+  
+  # Register this table in the metadata for zero-copy access
+  dataset_id <- uuid::UUIDgenerate()
+  timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+  
+  # Create JSON schema
+  schema_json <- jsonlite::toJSON(list(
+    columns = names(transformed_data),
+    dtypes = sapply(transformed_data, function(x) class(x)[1])
+  ), auto_unbox = TRUE)
+  
+  # Insert metadata for zero-copy access
+  dbExecute(con, "
+    INSERT INTO crosslink_metadata (
+      id, name, source_language, created_at, updated_at, description,
+      schema, table_name, arrow_data, version, current_version, 
+      schema_hash, access_languages
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ", list(
+    dataset_id, 
+    "transformed_data", 
+    "r", 
+    timestamp, 
+    timestamp,
+    "Transformed data with additional features (zero-copy)",
+    schema_json,
+    result_table_name,
+    TRUE,  # arrow_data = TRUE for zero-copy
+    1,
+    TRUE,
+    digest::digest(schema_json),
+    jsonlite::toJSON(c("python", "r", "julia", "cpp"))
+  ))
+  
+  # Clean up
+  dbDisconnect(con)
+  
+  cat("Transformed data: added", ncol(transformed_data) - ncol(data), "new features with zero-copy data sharing\n")
+  cat("Dataset registered with ID:", dataset_id, "\n")
 }
 
 # Run the process
-process_data(ctx) 
+process_data() 

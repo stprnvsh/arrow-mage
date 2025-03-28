@@ -1,0 +1,26 @@
+name = "DuckConnect"
+uuid = "85c7e1c9-1e3d-47f1-8983-f1a28b920ceb"
+authors = ["DuckData Team <duckdata@example.com>"]
+version = "0.1.0"
+
+[deps]
+DuckDB = "d2f5444f-5419-416c-9de3-40c7e042ad0c"
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+YAML = "ddb6d928-2868-570f-bddf-ab3f9cf99eb6"
+
+[compat]
+DuckDB = "0.9"
+DataFrames = "1.5"
+JSON = "0.21"
+YAML = "0.4"
+julia = "1.8"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"] 
