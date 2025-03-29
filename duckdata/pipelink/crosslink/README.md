@@ -1,276 +1,739 @@
-# 🔄 CrossLink: Cross-Language Data Sharing
+# 🔄 CrossLink: High-Performance Cross-Language Data Sharing
 
 <div align="center">
 
-![CrossLink Logo](https://via.placeholder.com/300x150?text=CrossLink)
+<!-- Consider adding a real logo here -->
+![CrossLink Placeholder Logo](https://via.placeholder.com/300x150?text=CrossLink)
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](../../../LICENSE)
+[![C++](https://img.shields.io/badge/C++-17-blue.svg)](https://isocpp.org/)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![R](https://img.shields.io/badge/R-4.0+-blue.svg)](https://www.r-project.org/)
 [![Julia](https://img.shields.io/badge/julia-1.6+-blue.svg)](https://julialang.org/)
-[![C++](https://img.shields.io/badge/C++-17-blue.svg)](https://isocpp.org/)
 
-**Seamlessly share data between Python, R, Julia, and C++ with DuckDB and Apache Arrow**
+**Zero-copy data sharing between C++, Python, R, and Julia using Apache Arrow**
 
 </div>
 
 ## 🌟 Overview
 
-**CrossLink** is the data sharing component of the DuckData framework, enabling seamless transfer of data between different programming languages. It combines the speed of [DuckDB](https://duckdb.org/) with the cross-language capabilities of [Apache Arrow](https://arrow.apache.org/) to provide efficient, zero-copy data sharing.
+CrossLink is a high-performance library for sharing data between programming languages with minimal overhead. It employs a unified C++ core with language-specific bindings that provide idiomatic access in each target language. By leveraging Apache Arrow's columnar memory format and direct memory access capabilities, CrossLink enables true zero-copy data sharing, significantly reducing the overhead traditionally associated with transferring data between language runtimes.
 
-### 🆕 New: Unified C++ Core with Cross-Language Bindings
+## 🏗️ Technical Architecture
 
-CrossLink now features a unified C++ core implementation that all language bindings (Python, R, and Julia) can utilize for improved performance and consistent behavior across languages. This architectural upgrade enables true zero-copy data sharing with optimized memory management.
+CrossLink employs a layered architecture with four primary components:
 
-## Features
+### 1. Central C++ Core (`libcrosslink`)
 
-- **Unified C++ Core**: A high-performance C++ implementation powers all language interfaces
-- **True Zero-Copy Data Sharing**: Share data between Python, R, Julia, and C++ without copying the underlying data
-- **Metadata Management**: Track dataset lineage, schema changes, and access patterns
-- **Direct Table References**: Use references to tables instead of copying data across language boundaries
-- **Lazy Query Evaluation**: Defer data materialization until absolutely necessary
-- **External Table Registration**: Register external DuckDB tables without importing the data
-- **Automatic Fallback**: Gracefully falls back to pure language implementations when C++ bindings aren't available
+The C++ core provides the fundamental functionality and is implemented in the `crosslink::CrossLink` class:
 
-## Implementation
-
-The cross-language architecture is implemented through several key mechanisms:
-
-1. **C++ Core Implementation**: A shared C++ codebase handles critical functionality like memory management and Arrow integration
-
-2. **Language-Specific Bindings**: Each language (Python, R, Julia) has bindings to the C++ core
-
-3. **Consistent API**: The same API is exposed across all languages for a uniform experience
-
-4. **Automatic Detection**: The system automatically detects if C++ bindings are available and falls back to pure language implementations if needed
-
-5. **Shared Memory Management**: Memory is managed by the C++ core, enabling zero-copy data sharing between all languages
-
-## Language Implementations
-
-### Python
-
-```python
-from pipelink.crosslink import CrossLink
-
-# Initialize CrossLink (automatically uses C++ bindings if available)
-cl = CrossLink(db_path="data.duckdb")
-
-# Push data to the shared database 
-import pandas as pd
-df = pd.DataFrame({'a': [1, 2, 3], 'b': ['x', 'y', 'z']})
-cl.push(df, name="my_dataset")
-
-# Pull data from the shared database
-retrieved_df = cl.pull("my_dataset")
-
-# Execute a SQL query
-result_df = cl.query("SELECT * FROM my_dataset WHERE a > 1")
-
-# The implementation automatically uses C++ bindings for better performance
+```
++-----------------------+
+|  C++ Core (crosslink) |
++-----------------------+
+| - Memory Management   |
+| - Table Registry      |
+| - Arrow Integration   |
+| - DuckDB Integration  |
+| - Metadata Services   |
+| - Notifications       |
++-----------------------+
 ```
 
-### R
+The core manages:
+- **Table Registry**: Maps dataset names/IDs to Arrow table references
+- **Memory Management**: Uses `std::shared_ptr<arrow::Table>` to manage table lifetimes
+- **Arrow Integration**: Handles exchange of table data structures
+- **DuckDB Integration**: SQL query execution across registered tables
+- **Metadata Services**: Tracks dataset lineage, schema, and access patterns
+- **Notification System**: Publishes data change events to subscribers
 
-```r
-library(CrossLink)
+**Implementation Details:**
 
-# Initialize CrossLink (automatically uses C++ bindings if available)
-cl <- crosslink_connect("data.duckdb")
-
-# Push data to the shared database
-data <- data.frame(a = c(1, 2, 3), b = c("x", "y", "z"))
-push_data(cl, data, name = "r_dataset")
-
-# Pull data from the shared database
-retrieved_data <- pull_data(cl, "my_dataset")
-
-# Execute a SQL query
-result_data <- query_data(cl, "SELECT * FROM my_dataset WHERE a > 1")
-
-# The implementation automatically uses C++ bindings for better performance
-```
-
-### Julia
-
-```julia
-using CrossLink
-
-# Initialize CrossLink (automatically uses C++ bindings if available)
-cl = CrossLinkManager("data.duckdb")
-
-# Push data to the shared database
-using DataFrames
-df = DataFrame(a = [1, 2, 3], b = ["x", "y", "z"])
-push_data(cl, df, "julia_dataset")
-
-# Pull data from the shared database
-retrieved_df = pull_data(cl, "my_dataset")
-
-# Execute a SQL query
-result_df = query_data(cl, "SELECT * FROM my_dataset WHERE a > 1")
-
-# The implementation automatically uses C++ bindings for better performance
-```
-
-### C++
+The core uses the pimpl idiom with the `CrossLink::Impl` class to hide implementation details:
 
 ```cpp
-#include "crosslink/crosslink.hpp"
+// Public API in crosslink.h
+class CrossLink {
+public:
+    CrossLink(const std::string& db_path = "crosslink.duckdb", bool debug = false);
+    std::string push(std::shared_ptr<arrow::Table> table, const std::string& name = "", ...);
+    std::shared_ptr<arrow::Table> pull(const std::string& identifier);
+    std::shared_ptr<arrow::Table> query(const std::string& sql);
+    std::vector<std::string> list_datasets();
+    // ... additional methods ...
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+```
+
+The implementation manages Arrow tables through several key mechanisms:
+1. **Table Sharing**: Tables pushed to CrossLink are stored as references, not copies
+2. **Reference Counting**: `std::shared_ptr` ensures tables remain in memory as long as needed
+3. **Metadata Database**: DuckDB stores metadata about shared tables and their schemas
+4. **Potential Shared Memory**: For cross-process sharing, memory-mapped files may be used
+
+### 2. Language Binding Layer
+
+Each target language has a binding layer that connects to the C++ core:
+
+```
++------------------+  +---------------+  +----------------+  +-----------------+
+| Python Binding   |  | R Binding     |  | Julia Binding  |  | Direct C++ Use  |
+| (pybind11)       |  | (Rcpp)        |  | (CxxWrap.jl)   |  |                 |
++------------------+  +---------------+  +----------------+  +-----------------+
+| - CrossLink class|  | - crosslink_  |  | - CrossLink    |  | - crosslink::   |
+|   wrapper        |  |   connect()   |  |   Manager      |  |   CrossLink     |
+| - Arrow adapters |  | - push_data() |  | - push_data()  |  |                 |
+| - pandas<->Arrow |  | - data.frame  |  | - DataFrame    |  |                 |
++------------------+  +---------------+  +----------------+  +-----------------+
+```
+
+Each binding provides:
+- **Idiomatic Interface**: Language-appropriate naming and object patterns
+- **Data Type Conversion**: Between native types and Arrow format
+- **Memory Management**: Integration with language-specific GC/reference counting
+- **Error Handling**: Translation between C++ exceptions and language exceptions
+- **Fallback Mechanisms**: Pure-language implementations when C++ bindings unavailable
+
+**Technical Binding Details:**
+
+- **Python**: Uses `pybind11` to wrap C++ objects with Python bindings
+- **R**: Uses `Rcpp` to create bindings between R and C++
+- **Julia**: Uses `CxxWrap.jl` to create bindings to C++ libraries
+
+Each binding also handles the conversion between:
+- Python: `pandas.DataFrame` ↔ `pyarrow.Table` ↔ `arrow::Table`
+- R: `data.frame` or `tibble` ↔ `arrow::Table` (R) ↔ `arrow::Table` (C++)
+- Julia: `DataFrame` ↔ `Arrow.Table` ↔ `arrow::Table` (C++)
+
+### 3. Apache Arrow Integration
+
+Arrow provides the memory model and data structure:
+
+```
++-----------------------------------+
+|       Apache Arrow Format         |
++-----------------------------------+
+| Contiguous Memory Region          |
++-----------------------------------+
+| +-----------+ +--------------+    |
+| | Column A  | | Column B     |    |
+| | Int32     | | Utf8 (String)|    |
+| +-----------+ +--------------+    |
+| | Buffers:  | | Buffers:     |    |
+| | - Validity| | - Validity   |    |
+| | - Data    | | - Offsets    |    |
+| |           | | - Data       |    |
+| +-----------+ +--------------+    |
++-----------------------------------+
+```
+
+Key Arrow integration components:
+- **Shared Memory Buffers**: Arrow's memory layout enables direct access without copying
+- **Zero-Copy Exchange**: Pointers to buffers are shared instead of the data itself
+- **Schema Preservation**: Type information is preserved across language boundaries
+- **Standard Interface**: Arrow C Data Interface enables sharing buffers across languages
+- **Memory Management**: Arrow's memory model works with each language's memory management
+
+### 4. Data Persistence Layer
+
+Optional DuckDB integration for persistence and querying:
+
+```
++-----------------------------------+
+|           DuckDB Layer            |
++-----------------------------------+
+| +-----------------+ +----------+  |
+| | Query Engine    | | Storage  |  |
+| | - SQL parsing   | | - Page   |  |
+| | - Optimization  | |   format |  |
+| | - Arrow         | | - WAL    |  |
+| |   integration   | |          |  |
+| +-----------------+ +----------+  |
++-----------------------------------+
+```
+
+DuckDB provides:
+- **File-based Storage**: Persists data to disk when needed
+- **SQL Interface**: Powerful query capabilities across tables
+- **Native Arrow Support**: Direct registration of Arrow tables
+- **Unified Query Layer**: Common SQL interface for all languages
+
+## ✨ Key Features
+
+*   **High-Performance C++ Core:** Efficient data management written in C++.
+*   **Zero-Copy Data Sharing:** Leverages Apache Arrow for direct memory access between languages, minimizing overhead.
+*   **Native Language Bindings:** Idiomatic APIs for Python, R, and Julia.
+*   **Direct C++ API:** Allows C++ applications to participate in data sharing directly.
+*   **Simple Interface:** Core operations (`push`, `pull`, `query`) for easy data exchange.
+*   **(Potential) Notifications:** C++ API includes hooks for data change notifications (binding support may vary).
+
+## 🔄 Cross-Language Data Flow
+
+When data moves between languages, CrossLink employs a specific pathway:
+
+```
++----------------+    +------------------+    +----------------+
+| Source Lang    |    | CrossLink C++    |    | Target Lang    |
+| (e.g., Python) |    | Core             |    | (e.g., R)      |
++-------+--------+    +--------+---------+    +-------+--------+
+        |                      |                      |
+        v                      |                      |
++----------------+             |              +----------------+
+| Native Format  |             |              | Native Format  |
+| (DataFrame)    |             |              | (data.frame)   |
++-------+--------+             |              +-------+--------+
+        |                      |                      ^
+        v                      |                      |
++----------------+             |              +----------------+
+| Language Arrow |             |              | Language Arrow |
+| (pyarrow.Table)|             |              | (arrow::Table) |
++-------+--------+             |              +-------+--------+
+        |                      |                      ^
+        v                      |                      |
++-------+--------+    +--------+---------+    +-------+--------+
+| Arrow C Data   |    | arrow::Table     |    | Arrow C Data   |
+| Interface      +---->  std::shared_ptr +---->  Interface     |
+| Struct         |    |   Memory Buffers |    | Reconstruction |
++----------------+    +------------------+    +----------------+
+```
+
+1. **Source Conversion**: Native data structures convert to language-specific Arrow objects
+2. **C++ Exchange**: The Arrow buffer references are passed to the C++ core
+3. **Buffer Sharing**: Memory buffers are managed by C++ core with reference counting
+4. **Target Access**: Target language bindings directly access the shared Arrow buffers
+5. **Target Conversion**: Arrow objects convert to native structures (only if requested)
+
+The zero-copy nature comes from steps 2-4, where no actual data is copied - only references to memory buffers are exchanged.
+
+## 💡 Implementation Mechanisms
+
+### Memory Management and Data Sharing
+
+**Core Principle**: Share pointers to memory buffers, not the data itself.
+
+**Technical Implementation**:
+
+1. **C++ Core**:
+   ```cpp
+   // In CrossLink::Impl::push
+   std::string push(std::shared_ptr<arrow::Table> table, const std::string& name) {
+       // Generate unique ID for the dataset
+       std::string dataset_id = name.empty() ? 
+           generate_uuid() : name;
+       
+       // Store the shared_ptr in an internal registry
+       table_registry_[dataset_id] = table;
+       
+       // Update metadata in database
+       metadata_manager_.create_dataset_metadata({
+           .id = dataset_id,
+           .name = dataset_id,
+           .schema_json = ArrowBridge::schema_to_json(table->schema())
+           // ... other metadata fields ...
+       });
+       
+       return dataset_id;
+   }
+   
+   // In CrossLink::Impl::pull
+   std::shared_ptr<arrow::Table> pull(const std::string& identifier) {
+       // Look up the table in the registry
+       auto it = table_registry_.find(identifier);
+       if (it != table_registry_.end()) {
+           return it->second;  // Return the same shared_ptr (zero-copy)
+       }
+       
+       // Table not in memory - might need to recreate or fail
+       throw std::runtime_error("Dataset not found: " + identifier);
+   }
+   ```
+
+2. **Language Bindings**:
+   - **Python**:
+```python
+     # In Python binding wrapper
+     def _wrap_arrow_table(cpp_table_ptr):
+         """Convert C++ arrow::Table to pyarrow.Table without copying data"""
+         # Use Arrow C Data Interface for zero-copy exchange
+         c_schema, c_arrays = _cpp_table_to_c_data_interface(cpp_table_ptr)
+         return pyarrow.Table._import_from_c(c_schema, c_arrays)
+     
+     # In CrossLink.pull method
+     def pull(self, identifier):
+         if self._cpp_instance:
+             cpp_table = self._cpp_instance.pull(identifier)
+             return _wrap_arrow_table(cpp_table)
+         else:
+             # Pure Python fallback implementation
+             # ... (would involve more data copying) ...
+     ```
+
+   - **R**:
+     ```r
+     # In R binding wrapper
+     wrap_arrow_table <- function(cpp_table_ptr) {
+       # Use Arrow C Data Interface for zero-copy exchange
+       c_schema <- cpp_table_to_c_schema(cpp_table_ptr)
+       c_arrays <- cpp_table_to_c_arrays(cpp_table_ptr)
+       return arrow::Table$import_from_c(c_schema, c_arrays)
+     }
+     
+     # In pull_data function
+     pull_data <- function(cl, identifier) {
+       if (cl$cpp_available) {
+         cpp_table <- cl$cpp_instance$pull(identifier)
+         return wrap_arrow_table(cpp_table)
+       } else {
+         # Pure R fallback implementation
+         # ... (would involve more data copying) ...
+       }
+     }
+     ```
+
+   - **Julia**:
+     ```julia
+     # In Julia binding wrapper
+     function wrap_arrow_table(cpp_table_ptr)
+         # Use Arrow C Data Interface for zero-copy exchange
+         c_schema, c_arrays = cpp_table_to_c_interface(cpp_table_ptr)
+         return Arrow.Table(c_schema, c_arrays)
+     end
+     
+     # In pull_data function
+     function pull_data(cl, identifier)
+         if cl.cpp_available
+             cpp_table = cl.cpp_instance.pull(identifier)
+             return wrap_arrow_table(cpp_table)
+         else
+             # Pure Julia fallback implementation
+             # ... (would involve more data copying) ...
+         end
+     end
+     ```
+
+### Arrow Integration Details
+
+1. **Internal Memory Structure**:
+   - Arrow tables consist of arrays of memory buffers (one per column)
+   - Each buffer is a contiguous memory region with a specific layout
+   - Data types are defined by Arrow's type system (int32, utf8, etc.)
+   - Each buffer carries a schema describing its layout
+
+2. **Zero-Copy Mechanism**:
+   - Arrow C Data Interface used to exchange table pointers between languages
+   - Memory layout is standardized across language implementations
+   - Buffer ownership is tracked through reference counting
+   - Garbage collection is coordinated through the C++ core
+
+3. **Schema Translation**:
+   ```
+   +-------------------+    +-------------------+    +-------------------+
+   | Python            |    | C++ Core          |    | R                 |
+   | Field(a, int32)   +---->Field(a, int32)    +---->Field(a, int32)    |
+   | Field(b, utf8)    |    | Field(b, utf8)    |    | Field(b, utf8)    |
+   +-------------------+    +-------------------+    +-------------------+
+   ```
+
+### Query Execution Flow
+
+When executing a SQL query, CrossLink uses the following flow:
+
+```
+Query: "SELECT a, b FROM dataset WHERE a > 10"
+    |
+    v
++-------------------+    +-------------------+    +-------------------+
+| Language Binding  |    | C++ Core          |    | DuckDB Engine     |
+| cl.query(sql)     +---->CrossLink::query() +---->conn.Query()       |
++-------------------+    +-------------------+    +-------------------+
+                               |                        |
+                               |                        v
+                               |              +-------------------+
+                               |              | Register tables   |
+                               |              | Execute query     |
+                               |              | Gather results    |
+                               |              +--------+----------+
+                               |                       |
+                               v                       v
+                         +------------------------------------+
+                         | New arrow::Table with query results |
+                         +------------------------------------+
+                               |
+                               v
++-------------------+    +-------------------+
+| Language Binding  |<---+ C++ Core returns  |
+| Return to caller  |    | arrow::Table      |
++-------------------+    +-------------------+
+```
+
+## 🛠️ Installation and Building
+
+### Prerequisites
+
+*   C++17 compatible compiler (GCC, Clang, MSVC)
+*   CMake (version 3.15+)
+*   Apache Arrow C++ library (including development headers) installed system-wide or locally.
+*   DuckDB C++ library (if the C++ core uses it for storage/querying) installed system-wide or locally.
+*   **For Python:** `pybind11`, `pyarrow`
+*   **For R:** `Rcpp`, `arrow` R package
+*   **For Julia:** `CxxWrap.jl`, `Arrow.jl`
+
+## ⚙️ Technical Implementation Details by Language
+
+### C++ Core (`libcrosslink`)
+
+- **Namespace**: `crosslink`
+- **Memory Model**: RAII with smart pointers
+- **Design Pattern**: pimpl idiom (`CrossLink::Impl`)
+- **Key Dependencies**:
+  - **Apache Arrow** (C++): For memory model and columnar data representation
+  - **DuckDB** (C++): For SQL execution and persistent storage
+- **Thread Safety**: Reference counting provides basic thread safety
+- **Notification System**: Callback-based with registration/unregistration
+
+**Core Implementation Files**:
+- `include/crosslink/crosslink.h`: Public API header
+- `cpp/src/crosslink.cpp`: Main implementation with pimpl pattern
+- `cpp/core/arrow_bridge.h`: Arrow integration
+- `cpp/core/metadata_manager.h`: Dataset metadata tracking
+- `cpp/core/shared_memory_manager.h`: Shared memory for cross-process access
+- `cpp/core/notification_system.h`: Observer pattern for data changes
+
+### Python Binding
+
+- **Binding Technology**: `pybind11`
+- **Key Dependencies**:
+  - `pyarrow`: Python bindings for Apache Arrow
+  - `pandas`: DataFrame integration
+  - `duckdb-python`: DuckDB Python API (optional for fallback)
+- **Module Structure**:
+  - `python/crosslink.py`: Compatibility layer
+  - `python/core/core.py`: Main `CrossLink` class
+  - `python/shared_memory/cpp_wrapper.py`: pybind11 wrapper
+  - `python/arrow_integration/arrow_integration.py`: Arrow utilities
+- **Fallback Mechanism**: Pure Python implementation using DuckDB
+
+### R Binding
+
+- **Binding Technology**: `Rcpp`
+- **Key Dependencies**:
+  - `arrow` R package: R bindings for Arrow
+  - `duckdb` R package: R bindings for DuckDB
+  - `data.frame`/`tibble`: Data structure integration
+- **Module Structure**:
+  - `r/crosslink.R`: Compatibility layer
+  - `r/core/core.R`: Main connection functions
+  - `r/shared_memory/cpp_wrapper.R`: Rcpp wrapper
+  - `r/arrow_integration/arrow_integration.R`: Arrow utilities
+- **Fallback Mechanism**: Pure R implementation using duckdb
+
+### Julia Binding
+
+- **Binding Technology**: `CxxWrap.jl`
+- **Key Dependencies**:
+  - `Arrow.jl`: Julia bindings for Arrow
+  - `DuckDB.jl`: Julia bindings for DuckDB
+  - `DataFrames.jl`: DataFrame integration
+- **Module Structure**:
+  - `julia/CrossLink.jl`: Main module
+  - `julia/core/core.jl`: `CrossLinkManager` struct
+  - `julia/shared_memory/cpp_wrapper.jl`: CxxWrap wrapper
+  - `julia/arrow_integration/arrow_integration.jl`: Arrow utilities
+- **Fallback Mechanism**: Pure Julia implementation using DuckDB.jl
+
+### Building the C++ Core
+
+The C++ core (`libcrosslink`) requires:
+- C++17 compatible compiler
+- CMake 3.15+
+- Apache Arrow C++ (1.0.0+)
+- DuckDB (0.3.0+)
+
+```bash
+# Navigate to C++ directory
+cd duckdata/pipelink/crosslink/cpp
+
+# Configure with CMake
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+# Build the library
+cmake --build build --config Release
+
+# Install (optional)
+cmake --install build
+```
+
+This builds:
+- `libcrosslink.so` / `libcrosslink.dylib` / `crosslink.dll` (shared library)
+- Language-specific binding libraries 
+
+### Language-Specific Installation
+
+#### Python
+
+```bash
+# Install from source
+cd duckdata/pipelink/crosslink/python
+pip install .
+
+# Requirements: pyarrow, pandas, duckdb
+```
+
+#### R
+
+```r
+# Install package
+install.packages("duckdata/pipelink/crosslink/r", repos=NULL, type="source")
+
+# Requirements: arrow, duckdb, jsonlite, uuid
+```
+
+#### Julia
+
+```julia
+# Add package from local path
+using Pkg
+Pkg.add(path="duckdata/pipelink/crosslink/julia")
+
+# Requirements: Arrow, DuckDB, DataFrames
+```
+
+## 📊 Usage Examples
+
+### C++ (`crosslink.h`)
+
+```cpp
+#include "crosslink/crosslink.h"
+#include <arrow/api.h>
+#include <arrow/builder.h>
+#include <iostream>
 
 int main() {
-    // Initialize CrossLink
-    CrossLink cl("data.duckdb");
-    
-    // Create and push a table
+    try {
+        // Initialize with default database path
+        crosslink::CrossLink cl;
+        
+        // Create an Arrow table
+        arrow::Int32Builder id_builder;
+        arrow::StringBuilder name_builder;
+        
+        ARROW_RETURN_NOT_OK(id_builder.AppendValues({1, 2, 3}));
+        ARROW_RETURN_NOT_OK(name_builder.AppendValues({"one", "two", "three"}));
+        
+        auto id_array = id_builder.Finish().ValueOrDie();
+        auto name_array = name_builder.Finish().ValueOrDie();
+        
     auto schema = arrow::schema({
-        arrow::field("a", arrow::int32()),
-        arrow::field("b", arrow::utf8())
-    });
-    
-    // Build the table
-    arrow::Int32Builder a_builder;
-    arrow::StringBuilder b_builder;
-    a_builder.AppendValues({1, 2, 3});
-    b_builder.AppendValues({"x", "y", "z"});
-    
-    std::shared_ptr<arrow::Table> table = arrow::Table::Make(
-        schema, {a_builder.Finish().ValueOrDie(), b_builder.Finish().ValueOrDie()});
-    
-    // Push the table
-    cl.Push(table, "cpp_dataset");
-    
-    // Pull a dataset
-    std::shared_ptr<arrow::Table> retrieved_table = cl.Pull("my_dataset");
-    
-    // Execute a SQL query
-    std::shared_ptr<arrow::Table> result_table = 
-        cl.Query("SELECT * FROM my_dataset WHERE a > 1");
+            arrow::field("id", arrow::int32()),
+            arrow::field("name", arrow::utf8())
+        });
+        
+        auto table = arrow::Table::Make(schema, {id_array, name_array});
+        
+        // Share the table
+        std::string dataset_id = cl.push(table, "example_table");
+        std::cout << "Pushed dataset with ID: " << dataset_id << std::endl;
+        
+        // List available datasets
+        auto datasets = cl.list_datasets();
+        std::cout << "Available datasets:" << std::endl;
+        for (const auto& name : datasets) {
+            std::cout << "- " << name << std::endl;
+        }
+        
+        // Pull the table back (zero-copy)
+        auto retrieved_table = cl.pull("example_table");
+        std::cout << "Retrieved table has " << retrieved_table->num_rows() 
+                  << " rows and " << retrieved_table->num_columns() << " columns" << std::endl;
+        
+        // Execute a query
+        auto result = cl.query("SELECT * FROM example_table WHERE id > 1");
+        std::cout << "Query result has " << result->num_rows() << " rows" << std::endl;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
     
     return 0;
 }
 ```
 
-## 📋 Zero-Copy Data Sharing Architecture
-
-CrossLink's zero-copy approach now has an improved architecture:
-
-1. **C++ Core**: The central C++ implementation handles memory management, Arrow integration, and shared memory coordination
-
-2. **Unified Memory Management**: All languages share a common memory management system through the C++ core
-
-3. **Language Binding Layers**: 
-   - **Python**: Uses pybind11 to interface with the C++ core
-   - **R**: Uses Rcpp to interface with the C++ core
-   - **Julia**: Uses CxxWrap.jl to interface with the C++ core
-
-4. **Fallback System**: If C++ bindings are unavailable, each language falls back to its native implementation
-
-### Technical Implementation
-
-When data is shared with the new architecture:
-
-1. The language binding converts data to Apache Arrow format
-2. The C++ core manages the memory and metadata
-3. When another language requests the data, it's accessed directly without copying
-4. All critical operations (push, pull, query) are routed through the C++ core when available
-5. Performance-critical operations like shared memory management are handled by the optimized C++ implementation
-
-## Benefits of the C++ Core
-
-- **Improved Performance**: The C++ implementation is faster and more memory-efficient
-- **Consistent Behavior**: The same core logic works across all languages
-- **Reduced Memory Usage**: Better memory management across language boundaries
-- **Simplified Maintenance**: Core functionality is maintained in one codebase
-- **Zero-Copy Everywhere**: True zero-copy data sharing between all supported languages
-
-## 📋 API Reference
-
-### Common API Across Languages
-
-| Function | Description |
-|----------|-------------|
-| `connect/init` | Connect to a DuckDB database (auto-detects and uses C++ bindings) |
-| `push` | Save a dataframe/table to the database (uses C++ implementation when available) |
-| `pull` | Retrieve a dataset as a dataframe/table (uses C++ implementation when available) |
-| `query` | Execute a SQL query and return results (uses C++ implementation when available) |
-| `list_datasets` | List available datasets |
-| `get_table_reference` | Get a direct reference to a table without copying |
-| `register_external_table` | Register a table from another database without copying |
-| `close` | Close the connection and clean up resources |
-
-## Installation
-
 ### Python
 
-```bash
-pip install pipelink-crosslink
+```python
+import pandas as pd
+import pyarrow as pa
+from pipelink.crosslink import CrossLink
+
+# Initialize CrossLink
+cl = CrossLink(db_path="crosslink.duckdb")
+
+# Create a pandas DataFrame
+df = pd.DataFrame({
+    'id': [1, 2, 3, 4, 5],
+    'value': ['a', 'b', 'c', 'd', 'e']
+})
+
+# Convert to Arrow table (explicit for demonstration)
+table = pa.Table.from_pandas(df)
+
+# Push to CrossLink
+dataset_id = cl.push(table, name="python_example")
+print(f"Pushed dataset with ID: {dataset_id}")
+
+# List available datasets
+datasets = cl.list_datasets()
+print(f"Available datasets: {datasets}")
+
+# Pull the dataset back (zero-copy if possible)
+retrieved_table = cl.pull("python_example")
+
+# Convert to pandas if needed
+retrieved_df = retrieved_table.to_pandas()
+print(f"Retrieved DataFrame:\n{retrieved_df}")
+
+# Execute a query
+result = cl.query("SELECT * FROM python_example WHERE id > 3")
+print(f"Query result:\n{result.to_pandas()}")
 ```
 
 ### R
 
 ```r
-install.packages("CrossLink")
+library(arrow)
+library(CrossLink)
+
+# Initialize CrossLink
+cl <- crosslink_connect(db_path = "crosslink.duckdb")
+
+# Create a data frame
+df <- data.frame(
+  id = 1:5,
+  value = c("a", "b", "c", "d", "e")
+)
+
+# Convert to Arrow table (explicit for demonstration)
+table <- arrow::as_arrow_table(df)
+
+# Push to CrossLink
+dataset_id <- push_data(cl, table, name = "r_example")
+cat("Pushed dataset with ID:", dataset_id, "\n")
+
+# List available datasets
+datasets <- list_datasets(cl)
+cat("Available datasets:", paste(datasets, collapse = ", "), "\n")
+
+# Pull the dataset back (zero-copy if possible)
+retrieved_table <- pull_data(cl, "r_example")
+
+# Convert to R data frame if needed
+retrieved_df <- as.data.frame(retrieved_table)
+cat("Retrieved data frame:\n")
+print(retrieved_df)
+
+# Execute a query
+result <- query_data(cl, "SELECT * FROM r_example WHERE id > 3")
+cat("Query result:\n")
+print(as.data.frame(result))
 ```
 
 ### Julia
 
 ```julia
-using Pkg
-Pkg.add("CrossLink")
+using Arrow
+using DataFrames
+using CrossLink
+
+# Initialize CrossLink
+cl = CrossLinkManager("crosslink.duckdb")
+
+# Create a DataFrame
+df = DataFrame(
+    id = 1:5,
+    value = ["a", "b", "c", "d", "e"]
+)
+
+# Convert to Arrow table (explicit for demonstration)
+table = Arrow.Table(df)
+
+# Push to CrossLink
+dataset_id = push_data(cl, table, "julia_example")
+println("Pushed dataset with ID: $dataset_id")
+
+# List available datasets
+datasets = list_datasets(cl)
+println("Available datasets: ", datasets)
+
+# Pull the dataset back (zero-copy if possible)
+retrieved_table = pull_data(cl, "julia_example")
+
+# Convert to DataFrame if needed
+retrieved_df = DataFrame(retrieved_table)
+println("Retrieved DataFrame:")
+println(retrieved_df)
+
+# Execute a query
+result = query_data(cl, "SELECT * FROM julia_example WHERE id > 3")
+println("Query result:")
+println(DataFrame(result))
 ```
 
-### Building C++ Bindings (Optional)
+## 📋 API Reference
 
-The language packages will work without C++ bindings, but performance is improved when they are available:
+### C++ Core API
 
-```bash
-# Build C++ core and bindings
-cd duckdata/pipelink/crosslink/cpp
-python build.py
-```
+| Method | Description | Parameters | Return |
+|--------|-------------|------------|--------|
+| `CrossLink(db_path, debug)` | Constructor | `db_path`: Database file path<br>`debug`: Enable verbose logging | `CrossLink` instance |
+| `push(table, name, description)` | Share a table | `table`: Arrow table to share<br>`name`: Dataset name (optional)<br>`description`: Dataset description | Dataset ID (string) |
+| `pull(identifier)` | Retrieve a shared table | `identifier`: Dataset name or ID | `std::shared_ptr<arrow::Table>` |
+| `query(sql)` | Execute a SQL query | `sql`: SQL query string | `std::shared_ptr<arrow::Table>` |
+| `list_datasets()` | List available datasets | None | `std::vector<std::string>` |
+| `register_notification(callback)` | Register for notifications | `callback`: Function to call on events | Registration ID (string) |
+| `unregister_notification(id)` | Unregister notification | `id`: Registration ID | None |
+| `cleanup()` | Clean up resources | None | None |
 
-#### Julia-specific Requirements
+### Python API
 
-For Julia bindings to work correctly:
+| Method | Description | Parameters | Return |
+|--------|-------------|------------|--------|
+| `CrossLink(db_path, debug)` | Constructor | `db_path`: Database file path<br>`debug`: Enable verbose logging | `CrossLink` instance |
+| `push(table, name, description)` | Share a table | `table`: PyArrow table or pandas DataFrame<br>`name`: Dataset name (optional)<br>`description`: Dataset description | Dataset ID (string) |
+| `pull(identifier)` | Retrieve a shared table | `identifier`: Dataset name or ID | PyArrow Table |
+| `query(sql)` | Execute a SQL query | `sql`: SQL query string | PyArrow Table |
+| `list_datasets()` | List available datasets | None | List of strings |
+| `close()` | Clean up resources | None | None |
 
-1. Install CxxWrap.jl in your Julia environment:
-```julia
-using Pkg
-Pkg.add("CxxWrap")
-```
+### R API
 
-2. Make sure libcxxwrap-julia is installed:
-```julia
-using Pkg
-Pkg.add("libcxxwrap_julia")
-```
+| Function | Description | Parameters | Return |
+|----------|-------------|------------|--------|
+| `crosslink_connect(db_path, debug)` | Create connection | `db_path`: Database file path<br>`debug`: Enable verbose logging | Connection object |
+| `push_data(cl, table, name, description)` | Share a table | `cl`: Connection<br>`table`: Arrow table or data.frame<br>`name`: Dataset name (optional)<br>`description`: Dataset description | Dataset ID (string) |
+| `pull_data(cl, identifier)` | Retrieve a shared table | `cl`: Connection<br>`identifier`: Dataset name or ID | Arrow Table |
+| `query_data(cl, sql)` | Execute a SQL query | `cl`: Connection<br>`sql`: SQL query string | Arrow Table |
+| `list_datasets(cl)` | List available datasets | `cl`: Connection | Character vector |
+| `close_connection(cl)` | Clean up resources | `cl`: Connection | None |
 
-3. If you encounter linking issues with JlCxx, try:
-```bash
-# On macOS
-export CXXWRAP_PREFIX_PATH=$(julia -e 'using CxxWrap; print(CxxWrap.prefix_path())')
-# On Linux
-export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$(julia -e 'using CxxWrap; print(CxxWrap.prefix_path())')/lib"
-# On Windows (in PowerShell)
-$env:PATH += ";$(julia -e 'using CxxWrap; print(CxxWrap.prefix_path())')\lib"
-```
+### Julia API
 
-The build script will automatically attempt to install these dependencies if missing.
+| Function | Description | Parameters | Return |
+|----------|-------------|------------|--------|
+| `CrossLinkManager(db_path, debug)` | Constructor | `db_path`: Database file path<br>`debug`: Enable verbose logging | `CrossLinkManager` instance |
+| `push_data(cl, table, name, description)` | Share a table | `cl`: Manager<br>`table`: Arrow.Table or DataFrame<br>`name`: Dataset name (optional)<br>`description`: Dataset description | Dataset ID (string) |
+| `pull_data(cl, identifier)` | Retrieve a shared table | `cl`: Manager<br>`identifier`: Dataset name or ID | Arrow.Table |
+| `query_data(cl, sql)` | Execute a SQL query | `cl`: Manager<br>`sql`: SQL query string | Arrow.Table |
+| `list_datasets(cl)` | List available datasets | `cl`: Manager | Vector of strings |
+| `close(cl)` | Clean up resources | `cl`: Manager | None |
 
-## 📊 Performance Comparison
+## 🤝 Contributing
 
-| Operation | Python-only | R-only | Julia-only | With C++ Bindings |
-|-----------|-------------|--------|------------|-------------------|
-| Push 1M rows | 1.2s | 1.5s | 0.9s | 0.4s |
-| Pull 1M rows | 0.8s | 1.1s | 0.7s | 0.3s |
-| Query 1M rows | 0.6s | 0.9s | 0.5s | 0.2s |
-| Memory Usage | Higher | Higher | Higher | Lower |
-
-## 📚 Contributing
-
-We welcome contributions to the CrossLink project. See [CONTRIBUTING.md](../../../CONTRIBUTING.md) for details.
+Contributions to CrossLink are welcome!
 
 ## 📜 License
 
-CrossLink is released under the MIT License. See [LICENSE](../../../LICENSE) for details.
+This project is licensed under the MIT License - see the [LICENSE](../../../LICENSE) file for details.
