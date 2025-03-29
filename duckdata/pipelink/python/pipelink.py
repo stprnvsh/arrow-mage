@@ -10,12 +10,16 @@ import tempfile
 import subprocess
 import logging
 import argparse
+import threading
 from typing import Dict, List, Any, Optional, Set
 import networkx as nx
 from pathlib import Path
 import warnings
 import uuid
 import time
+import json
+import datetime
+import traceback
 
 # Import monitoring module
 try:
@@ -32,12 +36,129 @@ except ImportError:
         except ImportError:
             raise ImportError("Cannot import monitoring module. Make sure the pipelink package is installed.")
 
+# Import the language daemon manager
+from .language_daemon import LanguageDaemonManager
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('pipelink')
+
+# Global daemon manager instance
+_daemon_manager = None
+
+def get_daemon_manager():
+    """Get global daemon manager instance"""
+    global _daemon_manager
+    if _daemon_manager is None:
+        _daemon_manager = LanguageDaemonManager()
+    return _daemon_manager
+
+# Helper functions for multiprocessing that need to be at module level for pickling
+def worker_process(task_queue, completed_nodes, failed_nodes, pipeline_config, 
+                  working_dir, pipeline_id, verbose, use_daemon, execution_order,
+                  node_processing_lock, nodes_in_process):
+    """Worker process that executes nodes from the task queue"""
+    while True:
+        try:
+            # Get next task with timeout
+            try:
+                node_id = task_queue.get(timeout=0.5)
+            except Exception:  # Using general Exception to handle Empty from queue
+                # Queue is empty, check if we should terminate
+                if len(completed_nodes) + len(failed_nodes) >= len(execution_order):
+                    break
+                time.sleep(0.1)  # Short sleep to avoid busy waiting
+                continue
+            
+            # Use lock to check if another worker is already processing this node
+            with node_processing_lock:
+                if node_id in nodes_in_process:
+                    # Another worker is handling this node, put it back in the queue
+                    task_queue.put(node_id)
+                    continue
+                
+                if node_id in completed_nodes or node_id in failed_nodes:
+                    # Node has already been processed by another worker
+                    continue
+                    
+                # Mark node as being processed
+                nodes_in_process[node_id] = True
+            
+            # Execute node
+            logger.info(f"Worker executing node '{node_id}'")
+            try:
+                # Get node configuration from pipeline config
+                node_config = None
+                for node in pipeline_config['nodes']:
+                    if node['id'] == node_id:
+                        node_config = node
+                        break
+                
+                if node_config is None:
+                    failed_nodes[node_id] = f"Node '{node_id}' not found in pipeline configuration"
+                    logger.error(f"Node '{node_id}' not found in pipeline configuration")
+                    with node_processing_lock:
+                        if node_id in nodes_in_process:
+                            del nodes_in_process[node_id]
+                    continue
+                
+                success = _run_node(
+                    node_config, pipeline_config, working_dir, 
+                    pipeline_id, verbose, use_daemon
+                )
+                
+                if success:
+                    completed_nodes[node_id] = True
+                    logger.info(f"Node '{node_id}' completed successfully")
+                else:
+                    failed_nodes[node_id] = "Execution failed"
+                    logger.error(f"Node '{node_id}' failed execution")
+            except Exception as e:
+                failed_nodes[node_id] = str(e)
+                logger.error(f"Error executing node '{node_id}': {str(e)}")
+            finally:
+                # Remove node from in-process set
+                with node_processing_lock:
+                    if node_id in nodes_in_process:
+                        del nodes_in_process[node_id]
+        except Exception as e:
+            logger.error(f"Worker process error: {e}")
+            break
+
+def dependency_checker(node_dependencies, completed_nodes, failed_nodes, task_queue, execution_order, nodes_in_process):
+    """Background thread that continuously checks for nodes ready to run"""
+    already_queued = set()
+    
+    while len(completed_nodes) + len(failed_nodes) < len(execution_order):
+        # Check for failed dependency chains
+        if failed_nodes:
+            for node_id in execution_order:
+                if node_id in already_queued or node_id in completed_nodes or node_id in failed_nodes:
+                    continue
+                    
+                # Check if any dependency has failed
+                deps = node_dependencies[node_id]
+                if any(dep in failed_nodes for dep in deps):
+                    failed_nodes[node_id] = "Dependency failed"
+                    logger.info(f"Node '{node_id}' skipped due to failed dependency")
+        
+        # Find nodes that are ready to run
+        for node_id in execution_order:
+            if (node_id in already_queued or node_id in completed_nodes or 
+                node_id in failed_nodes or node_id in nodes_in_process):
+                continue
+                
+            # Check if all dependencies are completed
+            deps = node_dependencies[node_id]
+            if all(dep in completed_nodes for dep in deps):
+                logger.info(f"Node '{node_id}' is ready to run, adding to queue")
+                task_queue.put(node_id)
+                already_queued.add(node_id)
+        
+        time.sleep(0.1)  # Short sleep to avoid busy waiting
 
 def _resolve_path(base_dir: str, path: str) -> str:
     """
@@ -209,42 +330,45 @@ def _get_execution_order(G: nx.DiGraph, only_nodes: Optional[List[str]] = None,
     return execution_order
 
 def _run_node(node_config: Dict[str, Any], pipeline_config: Dict[str, Any], 
-             working_dir: str, pipeline_id: str, verbose: bool = False) -> bool:
+             working_dir: str, pipeline_id: str, verbose: bool = False, 
+             use_daemon: bool = True) -> bool:
     """
     Run a single pipeline node
     
     Args:
-        node_config: Node configuration
-        pipeline_config: Full pipeline configuration
-        working_dir: Working directory
-        pipeline_id: Pipeline monitoring ID
+        node_config: Node configuration dictionary
+        pipeline_config: Complete pipeline configuration dictionary
+        working_dir: Working directory for the pipeline
+        pipeline_id: Unique pipeline ID
         verbose: Enable verbose output
+        use_daemon: Use daemon processes for language execution
         
     Returns:
-        bool: True if successful, False if failed
+        True if successful, False otherwise
     """
     node_id = node_config['id']
     language = node_config['language']
     
     logger.info(f"Running node '{node_id}' ({language})")
     
-    # Get pipeline metrics for monitoring
+    # Start resource monitoring
+    resource_monitor = ResourceMonitor()
+    resource_monitor.start()
+    
+    # Get pipeline metrics instance
     pipeline_metrics = PipelineMonitor.get_pipeline_metrics(pipeline_id)
     if pipeline_metrics:
         pipeline_metrics.start_node(node_id)
     
-    # Create resource monitor
-    resource_monitor = ResourceMonitor()
-    resource_monitor.start()
-    
     # Create metadata file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as f:
-        meta_path = f.name
-        
-        # Prepare metadata
+    meta_fd, meta_path = tempfile.mkstemp(suffix='.yml')
+    os.close(meta_fd)
+    
+    with open(meta_path, 'w') as f:
+        # Create metadata object
         metadata = {
+            'pipeline_id': pipeline_id,
             'node_id': node_id,
-            'pipeline_name': pipeline_config['name'],
             'inputs': node_config.get('inputs', []),
             'outputs': node_config.get('outputs', []),
             'params': node_config.get('params', {}),
@@ -261,51 +385,84 @@ def _run_node(node_config: Dict[str, Any], pipeline_config: Dict[str, Any],
     
     success = True
     try:
-        # Run script based on language
-        if language == 'python':
-            script_path = _resolve_path(working_dir, node_config['script'])
-            cmd = [sys.executable, script_path, meta_path]
-        elif language == 'r':
-            script_path = _resolve_path(working_dir, node_config['script'])
-            cmd = ['Rscript', script_path, meta_path]
-        elif language == 'julia':
-            script_path = _resolve_path(working_dir, node_config['script'])
-            cmd = ['julia', script_path, meta_path]
-        elif language == 'data':
-            # For data nodes, use a standard data connector script
-            script_path = os.path.join(os.path.dirname(__file__), 'data_node_runner.py')
-            cmd = [sys.executable, script_path, meta_path]
-        else:
-            raise ValueError(f"Unsupported language: {language}")
+        # Check if we should use daemon for this language
+        if use_daemon and language in ['python', 'r', 'julia']:
+            # Use daemon manager to execute
+            try:
+                daemon_manager = get_daemon_manager()
+                success, stdout, stderr = daemon_manager.execute_node(
+                    node_config, pipeline_config, working_dir, meta_path)
+                
+                # Process output
+                if not success:
+                    error_message = f"Node '{node_id}' failed with daemon execution"
+                    if not verbose:
+                        logger.error(error_message)
+                        logger.error(f"STDOUT: {stdout}")
+                        logger.error(f"STDERR: {stderr}")
+                    
+                    if pipeline_metrics:
+                        pipeline_metrics.fail_node(
+                            node_id, 
+                            f"{error_message}\nSTDOUT: {stdout}\nSTDERR: {stderr}"
+                        )
+                    
+                    raise RuntimeError(error_message)
+                
+                if verbose and stdout:
+                    logger.info(f"Output from '{node_id}':\n{stdout}")
+            except Exception as e:
+                logger.warning(f"Daemon execution failed, falling back to subprocess: {e}")
+                # Fall back to subprocess approach
+                use_daemon = False
         
-        # Run command
-        env = os.environ.copy()
-        proc = subprocess.run(
-            cmd,
-            env=env,
-            cwd=working_dir,
-            stdout=subprocess.PIPE if not verbose else None,
-            stderr=subprocess.PIPE if not verbose else None,
-            text=True
-        )
-        
-        # Check result
-        if proc.returncode != 0:
-            success = False
-            error_message = f"Node '{node_id}' failed with exit code {proc.returncode}"
+        # Use subprocess approach if daemon is not used
+        if not use_daemon:
+            # Run script based on language
+            if language == 'python':
+                script_path = _resolve_path(working_dir, node_config['script'])
+                cmd = [sys.executable, script_path, meta_path]
+            elif language == 'r':
+                script_path = _resolve_path(working_dir, node_config['script'])
+                cmd = ['Rscript', script_path, meta_path]
+            elif language == 'julia':
+                script_path = _resolve_path(working_dir, node_config['script'])
+                cmd = ['julia', script_path, meta_path]
+            elif language == 'data':
+                # For data nodes, use a standard data connector script
+                script_path = os.path.join(os.path.dirname(__file__), 'data_node_runner.py')
+                cmd = [sys.executable, script_path, meta_path]
+            else:
+                raise ValueError(f"Unsupported language: {language}")
             
-            if not verbose:
-                logger.error(error_message)
-                logger.error(f"STDOUT: {proc.stdout}")
-                logger.error(f"STDERR: {proc.stderr}")
+            # Run command
+            env = os.environ.copy()
+            proc = subprocess.run(
+                cmd,
+                env=env,
+                cwd=working_dir,
+                stdout=subprocess.PIPE if not verbose else None,
+                stderr=subprocess.PIPE if not verbose else None,
+                text=True
+            )
+            
+            # Check result
+            if proc.returncode != 0:
+                success = False
+                error_message = f"Node '{node_id}' failed with exit code {proc.returncode}"
                 
-            if pipeline_metrics:
-                pipeline_metrics.fail_node(node_id, f"{error_message}\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}")
-                
-            raise RuntimeError(error_message)
-        
-        if verbose and proc.stdout:
-            logger.info(f"Output from '{node_id}':\n{proc.stdout}")
+                if not verbose:
+                    logger.error(error_message)
+                    logger.error(f"STDOUT: {proc.stdout}")
+                    logger.error(f"STDERR: {proc.stderr}")
+                    
+                if pipeline_metrics:
+                    pipeline_metrics.fail_node(node_id, f"{error_message}\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}")
+                    
+                raise RuntimeError(error_message)
+            
+            if verbose and proc.stdout:
+                logger.info(f"Output from '{node_id}':\n{proc.stdout}")
         
         logger.info(f"Node '{node_id}' completed successfully")
     
@@ -336,7 +493,8 @@ def _run_node(node_config: Dict[str, Any], pipeline_config: Dict[str, Any],
     return success
 
 def run_pipeline(pipeline_file: str, only_nodes: Optional[List[str]] = None, 
-               start_from: Optional[str] = None, verbose: bool = False) -> None:
+               start_from: Optional[str] = None, verbose: bool = False,
+               use_daemon: bool = True, max_concurrency: Optional[int] = None) -> None:
     """
     Run a pipeline from a YAML file
     
@@ -345,6 +503,8 @@ def run_pipeline(pipeline_file: str, only_nodes: Optional[List[str]] = None,
         only_nodes: Only execute these nodes (and their dependencies)
         start_from: Start execution from this node
         verbose: Enable verbose output
+        use_daemon: Use persistent daemon processes for language execution
+        max_concurrency: Maximum number of nodes to run concurrently (defaults to CPU count)
     """
     logger.info(f"Loading pipeline from {pipeline_file}")
     
@@ -389,20 +549,63 @@ def run_pipeline(pipeline_file: str, only_nodes: Optional[List[str]] = None,
         pipeline_file=pipeline_file,
         nodes=execution_order
     )
+
+    # Implement concurrent execution using multiprocessing
+    import multiprocessing as mp
+    from multiprocessing import Manager
     
-    # Run each node in the execution order
-    success = True
+    # Set maximum concurrency (default to CPU count - 1)
+    if max_concurrency is None:
+        max_concurrency = max(1, mp.cpu_count() - 1)
+    
+    # Create shared manager for cross-process data structures
+    manager = Manager()
+    task_queue = manager.Queue()  # Queue for ready-to-run tasks
+    completed_nodes = manager.dict()  # Track completed nodes
+    failed_nodes = manager.dict()  # Track failed nodes with error messages
+    node_dependencies = manager.dict()  # Store dependencies for each node
+    node_processing_lock = manager.Lock()  # Lock for coordinating node processing
+    nodes_in_process = manager.dict()  # Track which nodes are currently being processed
+    
+    # Initialize dependency tracking
+    for node_id in G.nodes():
+        # Get predecessors (dependencies) for this node
+        predecessors = list(G.predecessors(node_id))
+        node_dependencies[node_id] = set(predecessors)
+    
+    # Start dependency checker thread
+    checker_thread = threading.Thread(
+        target=dependency_checker,
+        args=(node_dependencies, completed_nodes, failed_nodes, task_queue, execution_order, nodes_in_process)
+    )
+    checker_thread.daemon = True
+    checker_thread.start()
+    
+    # Start worker processes
+    logger.info(f"Starting {max_concurrency} worker processes for concurrent execution")
+    workers = []
+    for _ in range(max_concurrency):
+        p = mp.Process(
+            target=worker_process,
+            args=(task_queue, completed_nodes, failed_nodes, pipeline, 
+                 working_dir, pipeline_id, verbose, use_daemon, execution_order, node_processing_lock, nodes_in_process)
+        )
+        p.daemon = True
+        p.start()
+        workers.append(p)
+    
+    # Add nodes with no dependencies to the queue to start
     for node_id in execution_order:
-        # Get node configuration
-        node_config = G.nodes[node_id]
-        
-        # Run node
-        node_success = _run_node(node_config, pipeline, working_dir, pipeline_id, verbose)
-        
-        if not node_success:
-            success = False
-            logger.error(f"Node '{node_id}' failed. Stopping pipeline.")
-            break
+        if not node_dependencies[node_id]:
+            logger.info(f"Initial node '{node_id}' added to queue")
+            task_queue.put(node_id)
+    
+    # Wait for all workers to finish
+    for worker in workers:
+        worker.join()
+    
+    # Check results
+    success = len(failed_nodes) == 0
     
     # Finalize pipeline monitoring
     end_time = time.time()
@@ -418,6 +621,11 @@ def run_pipeline(pipeline_file: str, only_nodes: Optional[List[str]] = None,
         logger.info(f"Pipeline completed successfully in {execution_time} seconds")
     else:
         logger.error(f"Pipeline failed after {execution_time} seconds")
+        
+        # Print detailed error information
+        for node_id, error in failed_nodes.items():
+            logger.error(f"Node '{node_id}' failure: {error}")
+            
         sys.exit(1)
 
 def main():
@@ -426,6 +634,7 @@ def main():
     parser.add_argument('--only-nodes', help='Only execute these nodes (comma-separated)', default=None)
     parser.add_argument('--start-from', help='Start execution from this node', default=None)
     parser.add_argument('--verbose', help='Enable verbose output', action='store_true')
+    parser.add_argument('--no-daemon', help='Disable daemon processes', action='store_true')
     
     args = parser.parse_args()
     
@@ -435,7 +644,8 @@ def main():
         args.pipeline_file, 
         only_nodes=only_nodes, 
         start_from=args.start_from, 
-        verbose=args.verbose
+        verbose=args.verbose,
+        use_daemon=not args.no_daemon
     )
 
 if __name__ == '__main__':

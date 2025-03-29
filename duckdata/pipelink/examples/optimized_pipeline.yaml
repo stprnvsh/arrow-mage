@@ -1,0 +1,61 @@
+name: "Optimized Data Analysis Pipeline Example"
+description: "Example pipeline demonstrating optimized parallel execution and zero-copy data sharing"
+db_path: "pipeline_data.duckdb"
+working_dir: "./examples"
+
+nodes:
+  - id: generate_data
+    language: python
+    script: nodes/generate_data.py
+    outputs:
+      - raw_data
+    params:
+      rows: 5000000
+      description: "Large random dataset for performance testing"
+
+  - id: preprocess_dask
+    language: python
+    script: nodes/preprocess_dask.py
+    inputs:
+      - raw_data
+    outputs:
+      - preprocessed_data
+    depends_on: generate_data
+    params:
+      use_dask: true
+      npartitions: 8
+  
+  - id: analyze_r
+    language: r
+    script: nodes/analyze.R
+    inputs:
+      - preprocessed_data
+    outputs:
+      - r_analysis_results
+    depends_on: preprocess_dask
+    params:
+      model_type: "regression"
+  
+  - id: analyze_julia
+    language: julia
+    script: nodes/analyze.jl
+    inputs:
+      - preprocessed_data
+    outputs:
+      - julia_analysis_results
+    depends_on: preprocess_dask
+    params:
+      model_type: "classification"
+      target_column: "category"
+  
+  - id: create_report
+    language: python
+    script: nodes/create_report.py
+    inputs:
+      - r_analysis_results
+      - julia_analysis_results
+    outputs:
+      - final_report
+    depends_on: 
+      - analyze_r
+      - analyze_julia 

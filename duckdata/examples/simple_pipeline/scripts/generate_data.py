@@ -40,12 +40,11 @@ def main():
         'category': np.random.choice(['A', 'B', 'C'], size=rows)
     })
     
-    # Use CrossLink's direct zero-copy push
+    # Use CrossLink's push (the C++ bindings handle zero-copy automatically)
     dataset_id = cl.push(
         df, 
         name='raw_data',
-        description='Random data for demonstration with zero-copy capability',
-        enable_zero_copy=True
+        description='Random data for demonstration with zero-copy capability'
     )
     
     print(f"Generated {rows} rows of data with ID {dataset_id} using zero-copy")

@@ -34,6 +34,25 @@ if [ "$JULIA_INSTALLED" != "false" ]; then
     if [ -d "$SCRIPT_DIR/jl-pipelink" ]; then
         echo "Installing Julia package..."
         julia -e "using Pkg; Pkg.develop(path=\"$SCRIPT_DIR/jl-pipelink\")"
+        
+        # Install Julia dependencies for C++ bindings
+        echo "Installing Julia dependencies for C++ bindings..."
+        julia -e "using Pkg; Pkg.add(\"CxxWrap\"); Pkg.add(\"libcxxwrap_julia\")"
+        
+        # Set up environment variables for JlCxx
+        if [ "$(uname)" == "Darwin" ]; then  # macOS
+            export CXXWRAP_PREFIX_PATH=$(julia -e 'using CxxWrap; print(CxxWrap.prefix_path())')
+            echo "Set CXXWRAP_PREFIX_PATH=$CXXWRAP_PREFIX_PATH"
+        elif [ "$(uname)" == "Linux" ]; then  # Linux
+            export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$(julia -e 'using CxxWrap; print(CxxWrap.prefix_path())')/lib"
+            echo "Updated LD_LIBRARY_PATH with JlCxx library path"
+        fi
+        
+        # Run the diagnostic script if it exists
+        if [ -f "$SCRIPT_DIR/pipelink/crosslink/julia/setup_julia_bindings.jl" ]; then
+            echo "Running Julia binding setup script..."
+            julia "$SCRIPT_DIR/pipelink/crosslink/julia/setup_julia_bindings.jl"
+        fi
     else
         echo "Warning: jl-pipelink directory not found. Skipping Julia package installation."
     fi

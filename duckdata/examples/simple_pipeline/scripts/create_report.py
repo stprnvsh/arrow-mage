@@ -75,8 +75,8 @@ def main():
     
     # Register the table with CrossLink for zero-copy
     dataset_id = cl.register_external_table(
-        db_path,
-        result_table_name,
+        table_name=result_table_name,
+        data=None,  # Not needed since table already exists in DuckDB
         name="final_report",
         description="Final report with summary metrics (zero-copy)"
     )

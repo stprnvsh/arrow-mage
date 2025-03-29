@@ -205,4 +205,63 @@ Contributions to PipeLink are welcome! Please feel free to submit a Pull Request
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](../../LICENSE) file for details. 
+This project is licensed under the MIT License - see the [LICENSE](../../LICENSE) file for details.
+
+## Performance Optimization: Language Daemons
+
+PipeLink now includes a language daemon feature to dramatically reduce the overhead of starting new language processes for each pipeline step. This is especially beneficial for Julia, which has significant startup time.
+
+### How It Works
+
+Instead of starting a new process for each language node (Python, R, Julia), PipeLink can maintain persistent daemon processes for each language. When a pipeline step needs to execute code in a particular language, it sends the execution request to the appropriate daemon process instead of starting a new one.
+
+### Benefits
+
+- **Reduced startup overhead**: Eliminates the 4-5 second startup time for Julia and 1-2 seconds for R
+- **Improved performance**: Makes cross-language pipelines perform closer to single-language ones
+- **Better resource utilization**: Avoids repeatedly loading the same libraries and runtime environments
+
+### Using Daemons
+
+Language daemons are enabled by default when running pipelines. You can:
+
+1. **Start daemons manually before running pipelines**:
+   ```bash
+   # Start all available language daemons
+   pipelink daemon start
+   
+   # Start specific language daemons
+   pipelink daemon start --languages python,julia
+   
+   # Check daemon status
+   pipelink daemon status
+   
+   # Stop daemons when done
+   pipelink daemon stop
+   ```
+
+2. **Use the convenience script**:
+   ```bash
+   ./start_daemons.sh
+   ```
+
+3. **Disable daemons if needed**:
+   ```bash
+   pipelink run pipeline.yml --no-daemon
+   ```
+
+### Daemon Management
+
+Daemons will remain running until explicitly stopped or the system is restarted. They use minimal resources when idle and are automatically started when needed if not already running.
+
+You can view the status and control daemons with:
+```bash
+# Check status
+pipelink daemon status
+
+# Stop all daemons
+pipelink daemon stop
+
+# Stop specific daemons
+pipelink daemon stop --languages julia
+``` 

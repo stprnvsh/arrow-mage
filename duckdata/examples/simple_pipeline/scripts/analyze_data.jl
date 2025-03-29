@@ -9,9 +9,51 @@ using Statistics
 using DataFrames
 using JSON
 using Dates
+using CSV
+using UUIDs  # Add UUID for consistent dataset IDs
+
+# Import CrossLink with a more robust path resolution
+function import_crosslink()
+    try
+        # First try standard path from setup_julia.jl
+        crosslink_path = joinpath(dirname(Base.find_package("DuckDB")), "..", "..", "crosslink", "crosslink.jl")
+        if isfile(crosslink_path)
+            include(crosslink_path)
+            return true
+        end
+    catch
+        # Fallback options
+    end
+    
+    try
+        # Try direct path relative to script location
+        crosslink_path = joinpath(dirname(@__DIR__), "..", "..", "pipelink", "crosslink", "julia", "crosslink.jl")
+        if isfile(crosslink_path)
+            include(crosslink_path)
+            return true
+        end
+    catch
+        # Fallback options
+    end
+    
+    try
+        # Try original path
+        crosslink_path = joinpath(dirname(Base.find_package("DuckDB")), "..", "..", "..", "pipelink", "crosslink", "julia", "crosslink.jl")
+        if isfile(crosslink_path)
+            include(crosslink_path)
+            return true
+        end
+    catch
+        # Fallback options
+    end
+    
+    return false
+end
 
 # Import CrossLink
-include(joinpath(dirname(Base.find_package("DuckDB")), "..", "..", "..", "pipelink", "crosslink", "julia", "crosslink.jl"))
+if !import_crosslink()
+    error("Failed to import CrossLink module. Please run setup_julia.jl first.")
+end
 using .CrossLink
 
 println("Starting analyze_data.jl")
@@ -48,10 +90,10 @@ function analyze_data(data, detailed=false)
     for (key, value) in stats
         if value isa Dict
             for (subkey, subvalue) in value
-                push!(result_rows, (metric = "$(key)_$(subkey)", value = subvalue))
+                push!(result_rows, (statistic = "$(key)_$(subkey)", value = subvalue))
             end
         else
-            push!(result_rows, (metric = key, value = value))
+            push!(result_rows, (statistic = key, value = value))
         end
     end
     
@@ -77,31 +119,59 @@ function main()
     
     # Initialize CrossLink manager with the database
     println("Initializing CrossLink with database: $db_path")
-    manager = CrossLinkManager(db_path)
+    manager = CrossLinkManager(db_path, true)  # Enable debug mode
     
-    # Get transformed data using true zero-copy
-    println("Getting transformed data via CrossLink (zero-copy)...")
-    transformed_data = pull_data(manager, "transformed_data", zero_copy=true)
-    println("Loaded data via zero-copy: $(nrow(transformed_data)) rows, columns: $(join(names(transformed_data), ", "))")
+    # Get transformed data using CrossLink's pull_data
+    println("Getting transformed data via CrossLink...")
     
-    # Analyze the data
-    println("Analyzing data...")
-    result = analyze_data(transformed_data)
-    println("Analysis complete with $(nrow(result)) statistics calculated")
-    
-    # Use push_data with our result
-    println("Saving analysis results with CrossLink...")
-    dataset_id = push_data(
-        manager, 
-        result, 
-        "analysis_results",
-        description="Statistical analysis of the transformed data",
-        arrow_data=true
-    )
-    
-    println("Analysis results shared via CrossLink with ID: $dataset_id")
+    # Try with error handling
+    try
+        transformed_data = pull_data(manager, "transformed_data", zero_copy=true)
+        
+        println("Loaded data: $(nrow(transformed_data)) rows, columns: $(join(names(transformed_data), ", "))")
+        
+        # Analyze the data
+        println("Analyzing data...")
+        result = analyze_data(transformed_data)
+        println("Analysis complete with $(nrow(result)) statistics calculated")
+        
+        # Save analysis results using CrossLink's push_data
+        println("Saving analysis results with CrossLink...")
+        try
+            # Use push_data with memory mapping for zero-copy
+            dataset_id = push_data(
+                manager,
+                result,
+                "analysis_results",
+                description="Statistical analysis of the transformed data",
+                enable_zero_copy=true,
+                memory_mapped=true,
+                shared_memory=false,
+                access_languages=["python", "r", "julia", "cpp"]
+            )
+            
+            println("Analysis results saved with dataset ID: $dataset_id")
+        catch e
+            println("Error saving results: $e")
+            # Print stack trace for debugging
+            Base.showerror(stderr, e, catch_backtrace())
+            rethrow(e)
+        end
+    catch e
+        println("Error retrieving or processing data: $e")
+        # Print stack trace for debugging
+        Base.showerror(stderr, e, catch_backtrace())
+        rethrow(e)
+    end
 end
 
 # Run the main function
-main()
-println("analyze_data.jl completed") 
+try
+    main()
+    println("analyze_data.jl completed")
+catch e
+    println("Error in analyze_data.jl: $e")
+    Base.showerror(stderr, e, catch_backtrace())
+    # Re-throw to ensure the pipeline knows there was an error
+    rethrow(e)
+end 
