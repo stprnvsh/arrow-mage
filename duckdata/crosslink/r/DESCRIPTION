@@ -1,0 +1,20 @@
+Package: CrossLink
+Type: Package
+Title: CrossLink R Bindings
+Version: 0.1.0
+Authors@R: person("CrossLink", "Maintainer", email = "pranav.sateesh@usi.ch", role = c("aut", "cre"))
+Description: R interface for the CrossLink library, enabling zero-copy data sharing between R, Python, Julia, and C++.
+License: MIT # Or your chosen license
+Encoding: UTF-8
+LazyData: true
+Imports:
+    arrow (>= 10.0.0),
+    duckdb (>= 1.2.1), 
+    jsonlite,
+    uuid,
+    dplyr
+LinkingTo: 
+    arrow,
+    duckdb
+# RoxygenNote: 7.2.0 # Or the version you use if generating docs with Roxygen
+NeedsCompilation: yes # Important: Indicates compiled code is present 

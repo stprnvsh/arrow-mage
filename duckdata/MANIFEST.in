@@ -1,7 +1,0 @@
-include README.md
-include LICENSE
-include pipelink/r/*
-include pipelink/julia/*
-include pipelink/crosslink/r/*
-include pipelink/crosslink/julia/*
-recursive-include examples * 

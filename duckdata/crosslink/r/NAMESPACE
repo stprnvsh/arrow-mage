@@ -1,0 +1,6 @@
+# Import necessary functions from other packages
+importFrom(arrow, Table, Schema, RecordBatch)
+importFrom(jsonlite, fromJSON)
+# importFrom(duckdb, duckdb_connect) # Removed, relying on C++ linking
+
+# Tell R to load the dynamic library containing C++ functions

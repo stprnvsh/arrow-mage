@@ -1,8 +1,0 @@
-pipeline_id: test-pipeline-123
-node_id: r-test-node
-inputs: []
-outputs: ["sample_data"]
-params:
-  sample_size: 10
-db_path: test.duckdb
-language: r 
