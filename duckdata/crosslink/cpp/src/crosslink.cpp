@@ -186,13 +186,15 @@ public:
                           << table->num_columns() << " columns" << std::endl;
             }
             
-            // Use ArrowBridge to share the table
-            std::string dataset_id = ArrowBridge::share_arrow_table(
-                db_path_, table, name, true, true);
+            // Use ArrowBridge to share the table, passing the member metadata_manager_
+            std::string dataset_name = ArrowBridge::share_arrow_table(
+                metadata_manager_, table, name, true, true, db_path_); // Pass metadata_manager_ and db_path_
             
-            // Create and store metadata
+            // Create and store metadata - This is now done *inside* share_arrow_table
+            // Remove redundant metadata creation here:
+            /*
             DatasetMetadata metadata;
-            metadata.id = dataset_id;
+            metadata.id = dataset_id; // dataset_id is no longer returned
             metadata.name = name.empty() ? "cpp_" + dataset_id.substr(0, 8) : name;
             metadata.source_language = "cpp";
             metadata.created_at = ArrowBridge::get_current_timestamp();
@@ -203,32 +205,47 @@ public:
             metadata.current_version = true;
             metadata.schema_hash = ""; // Would compute schema hash in real implementation
             metadata.access_languages = {"cpp", "python", "r", "julia"};
-            metadata.shared_memory_key = dataset_id;
             
             // Store schema as JSON
             metadata.arrow_schema_json = metadata_manager_.schema_to_json(table->schema());
             
             // Store metadata
             metadata_manager_.create_dataset_metadata(metadata);
+            */
             
-            // Notify others about the new dataset
+            // Notify others about the new dataset (use the returned name)
             NotificationEvent event;
-            event.dataset_id = dataset_id;
+            // Need the actual dataset ID for notification - perhaps share_arrow_table should return pair(id, name)?
+            // For now, let's assume notification system can handle names or we modify later.
+            // We *don't* have the dataset_id here anymore, only the name.
+            // Let's retrieve the ID from metadata using the returned name for the notification.
+            std::string dataset_id_for_notification;
+            try {
+                DatasetMetadata pushed_meta = metadata_manager_.get_dataset_metadata(dataset_name);
+                dataset_id_for_notification = pushed_meta.id;
+            } catch (const std::exception& meta_err) {
+                std::cerr << "Warning: Could not retrieve metadata for dataset '" << dataset_name 
+                          << "' immediately after push to get ID for notification: " << meta_err.what() << std::endl;
+                dataset_id_for_notification = dataset_name; // Fallback to using name in notification
+            }
+
+            event.dataset_id = dataset_id_for_notification; 
             event.type = NotificationType::DATA_UPDATED;
             event.source_language = "cpp";
-            event.timestamp = metadata.created_at;
+            // Convert timestamp_t to string for NotificationEvent
+            event.timestamp = duckdb::Timestamp::ToString(ArrowBridge::get_current_duckdb_timestamp()); 
             NotificationSystem::instance().notify(event);
             
-            // Log the access
+            // Log the access (using the ID retrieved for notification)
             metadata_manager_.log_access(
-                dataset_id, "cpp", "push", "arrow", true
+                dataset_id_for_notification, "cpp", "push", "arrow", true
             );
             
             if (debug_) {
-                std::cout << "Table pushed successfully with ID: " << dataset_id << std::endl;
+                std::cout << "Table pushed successfully with Name: " << dataset_name << std::endl;
             }
             
-            return dataset_id;
+            return dataset_name; // Return the name as intended
         } catch (const std::exception& e) {
             if (debug_) {
                 std::cerr << "Error pushing table: " << e.what() << std::endl;
@@ -243,15 +260,27 @@ public:
                 std::cout << "Pulling table: " << identifier << std::endl;
             }
             
-            // Get metadata
-            DatasetMetadata metadata = metadata_manager_.get_dataset_metadata(identifier);
+            // Get metadata using member manager_
+            // DatasetMetadata metadata = metadata_manager_.get_dataset_metadata(identifier);
+            // This lookup is now inside get_arrow_table
             
-            // Get the table
-            auto table = ArrowBridge::get_arrow_table(db_path_, metadata.id);
+            // Get the table using ArrowBridge, passing the member metadata_manager_
+            auto table = ArrowBridge::get_arrow_table(metadata_manager_, identifier, db_path_); // Pass metadata_manager_ and db_path_
             
-            // Log the access
+            // Log the access - We need the actual dataset ID here.
+            // Retrieve metadata again to get the ID, as identifier could be name or ID.
+             std::string actual_dataset_id;
+             try {
+                 DatasetMetadata pulled_meta = metadata_manager_.get_dataset_metadata(identifier);
+                 actual_dataset_id = pulled_meta.id;
+             } catch (const std::exception& meta_err) {
+                  std::cerr << "Warning: Could not retrieve metadata for dataset '" << identifier 
+                            << "' during pull operation logging: " << meta_err.what() << std::endl;
+                  actual_dataset_id = identifier; // Fallback to using the provided identifier
+             }
+
             metadata_manager_.log_access(
-                metadata.id, "cpp", "pull", "arrow", true
+                actual_dataset_id, "cpp", "pull", "arrow", true
             );
             
             if (debug_) {
@@ -268,6 +297,8 @@ public:
             
             // Log the failed access
             try {
+                 // We might not have the ID if the initial metadata lookup failed.
+                 // Log using the identifier provided.
                 metadata_manager_.log_access(
                     identifier, "cpp", "pull", "arrow", false
                 );

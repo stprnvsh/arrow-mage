@@ -40,14 +40,38 @@ def push(cl, data, name=None, description=None, zero_copy=True, use_arrow=True,
     
     # Use C++ implementation if available
     if hasattr(cl, '_cpp_instance') and cl._cpp_instance is not None:
-        # Convert to Arrow table if needed
-        if hasattr(data, "to_arrow"):
-            data = data.to_arrow()
-        elif hasattr(data, "__array__"):
-            import pyarrow as pa
-            data = pa.Table.from_pandas(data)
-        
+        import pyarrow as pa # Ensure pa is imported
+        import warnings # Ensure warnings is imported
+
+        # Check if data needs conversion to Arrow Table
+        if not isinstance(data, pa.Table): # Check if it's NOT already an Arrow Table
+            if hasattr(data, "to_arrow"):  # Convert pandas DataFrame etc.
+                cl._log(f"Converting input data type {type(data)} using to_arrow()")
+                data = data.to_arrow()
+            elif hasattr(data, "__dataframe__"): # Check for DataFrame Interface Protocol
+                # Use pandascompat to convert if possible (more robust than __array__)
+                cl._log(f"Converting input data type {type(data)} using __dataframe__ protocol")
+                # Ensure pandas_compat is available or handle import error
+                try:
+                    # Assuming pandas_compat might be part of pyarrow or needs separate import
+                    from pyarrow.pandas_compat import dataframe_to_arrow
+                    data = dataframe_to_arrow(data)
+                except ImportError:
+                     warnings.warn(f"Cannot convert data using __dataframe__ protocol: pyarrow.pandas_compat unavailable?")
+                     # Let the C++ binding try to handle it, or raise error below
+                     pass # Fall through, C++ binding might still fail
+            # Removed the problematic elif hasattr(data, "__array__") check
+            else:
+                # Optional: Add a warning or raise an error for unsupported types
+                warnings.warn(f"Input data type {type(data)} might not be directly usable by C++ backend. "
+                              "Passing as-is. C++ binding expects pyarrow.Table or compatible.")
+        else:
+            cl._log("Input data is already a pyarrow.Table, no conversion needed for C++ backend.")
+
+
         # Push using C++ implementation
+        # The C++ binding's python_table_to_cpp will handle the final check/unwrap
+        cl._log(f"Calling C++ push with data type: {type(data)}")
         return cl._cpp_instance.push(data, name or "", description or "")
     
     # Python implementation

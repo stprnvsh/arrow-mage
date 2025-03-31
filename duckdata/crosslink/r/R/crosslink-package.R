@@ -3,11 +3,16 @@
 #' This module provides R functions for working with the CrossLink system,
 #' which enables seamless zero-copy data sharing between R, Python, Julia, and C++
 #' 
-#' @importFrom duckdb duckdb_connect duckdb_execute duckdb_fetch_arrow
-#' @importFrom arrow read_arrow write_arrow Table
+#' @importFrom Rcpp sourceCpp
+#' @importFrom DBI dbConnect dbDisconnect dbExecute dbGetQuery dbWriteTable
 #' @importFrom jsonlite fromJSON toJSON
 #' @importFrom uuid UUIDgenerate
 #' @importFrom digest digest
+#' @import arrow
+#' @import duckdb
+#' @useDynLib CrossLink, .registration = TRUE
+#' @name CrossLink-package
+"_PACKAGE"
 
 # Global cache for shared memory regions
 .crosslink_shared_memory_pool <- new.env()

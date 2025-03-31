@@ -5,6 +5,7 @@
 #include <memory>
 #include <arrow/api.h>
 #include <duckdb.hpp>
+#include <mutex>
 
 namespace crosslink {
 
@@ -14,6 +15,8 @@ struct DatasetMetadata {
     std::string source_language;
     std::string created_at;
     std::string updated_at;
+    duckdb::timestamp_t created_at_ts;
+    duckdb::timestamp_t updated_at_ts;
     std::string description;
     std::string schema_json;
     std::string table_name;
@@ -73,6 +76,7 @@ private:
     std::unique_ptr<duckdb::DuckDB> db_;
     std::unique_ptr<duckdb::Connection> conn_;
     std::unordered_map<std::string, DatasetMetadata> metadata_cache_;
+    std::mutex cache_mutex_;
 };
 
 } // namespace crosslink 

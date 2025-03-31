@@ -8,6 +8,7 @@
 #include <random>
 #include <sstream>
 #include <iomanip>
+#include <duckdb.hpp>
 
 namespace crosslink {
 
@@ -44,33 +45,30 @@ std::string ArrowBridge::generate_uuid() {
     return ss.str();
 }
 
-std::string ArrowBridge::get_current_timestamp() {
+duckdb::timestamp_t ArrowBridge::get_current_duckdb_timestamp() {
     auto now = std::chrono::system_clock::now();
-    auto in_time_t = std::chrono::system_clock::to_time_t(now);
-
-    std::stringstream ss;
-    ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d %X");
-    return ss.str();
+    auto epoch = now.time_since_epoch();
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(epoch);
+    return duckdb::Timestamp::FromEpochMicroSeconds(us.count());
 }
 
 std::string ArrowBridge::share_arrow_table(
-    const std::string& db_path,
+    MetadataManager& metadata_manager,
     std::shared_ptr<arrow::Table> table,
     const std::string& name,
     bool use_shared_memory,
-    bool memory_mapped) {
+    bool memory_mapped,
+    const std::string& db_path) {
     
     auto dataset_id = generate_uuid();
     
-    // Initialize metadata manager
-    MetadataManager metadata_manager(db_path);
-    
-    // Create metadata
     DatasetMetadata metadata;
     metadata.id = dataset_id;
     metadata.name = name.empty() ? "arrow_" + dataset_id.substr(0, 8) : name;
     metadata.source_language = "cpp";
-    metadata.created_at = get_current_timestamp();
+    metadata.created_at_ts = get_current_duckdb_timestamp();
+    metadata.updated_at_ts = metadata.created_at_ts;
+    metadata.created_at = duckdb::Timestamp::ToString(metadata.created_at_ts);
     metadata.updated_at = metadata.created_at;
     metadata.description = "";
     metadata.arrow_data = true;
@@ -138,21 +136,20 @@ std::string ArrowBridge::share_arrow_table(
     
     // TODO: Add notification for data update
     
-    return dataset_id;
+    return metadata.name;
 }
 
 std::shared_ptr<arrow::Table> ArrowBridge::get_arrow_table(
-    const std::string& db_path,
-    const std::string& identifier) {
+    MetadataManager& metadata_manager,
+    const std::string& identifier,
+    const std::string& db_path) {
     
-    // Retrieve metadata to determine if table is in shared memory or memory-mapped file
-    MetadataManager metadata_manager(db_path);
     auto metadata = metadata_manager.get_dataset_metadata(identifier);
     
     // First try shared memory if available
     if (!metadata.shared_memory_key.empty()) {
         auto& shm_manager = SharedMemoryManager::instance();
-        auto region = shm_manager.get_region(metadata.shared_memory_key);
+        auto region = shm_manager.get_region(metadata.id, db_path);
         
         if (region) {
             // Deserialize table from shared memory
@@ -160,29 +157,22 @@ std::shared_ptr<arrow::Table> ArrowBridge::get_arrow_table(
             arrow::io::BufferReader reader(buffer);
             auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(&reader);
             if (!reader_result.ok()) {
-                throw std::runtime_error("Failed to open IPC stream: " + 
-                                        reader_result.status().ToString());
+                throw std::runtime_error("Failed to open IPC stream from shared memory: " + reader_result.status().ToString());
             }
-            
             auto batch_reader = reader_result.ValueOrDie();
             std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
-            
             arrow::Status status;
             std::shared_ptr<arrow::RecordBatch> batch;
             while ((status = batch_reader->ReadNext(&batch)).ok() && batch != nullptr) {
                 batches.push_back(batch);
             }
-            
             if (!status.ok()) {
                 throw std::runtime_error("Error reading record batches: " + status.ToString());
             }
-            
             auto table_result = arrow::Table::FromRecordBatches(batches);
             if (!table_result.ok()) {
-                throw std::runtime_error("Failed to create table from batches: " + 
-                                        table_result.status().ToString());
+                throw std::runtime_error("Failed to create table from batches: " + table_result.status().ToString());
             }
-            
             return table_result.ValueOrDie();
         }
     }
@@ -208,7 +198,7 @@ std::shared_ptr<arrow::Table> ArrowBridge::get_arrow_table(
         for (int i = 0; i < reader->num_record_batches(); i++) {
             auto batch_result = reader->ReadRecordBatch(i);
             if (!batch_result.ok()) {
-                throw std::runtime_error("Error reading record batch: " + 
+                throw std::runtime_error("Error reading record batch from memory-mapped file: " + 
                                         batch_result.status().ToString());
             }
             batches.push_back(batch_result.ValueOrDie());
@@ -216,14 +206,14 @@ std::shared_ptr<arrow::Table> ArrowBridge::get_arrow_table(
         
         auto table_result = arrow::Table::FromRecordBatches(batches);
         if (!table_result.ok()) {
-            throw std::runtime_error("Failed to create table from batches: " + 
+            throw std::runtime_error("Failed to create table from batches from memory-mapped file: " + 
                                     table_result.status().ToString());
         }
         
         return table_result.ValueOrDie();
     }
     
-    throw std::runtime_error("Table not found or not accessible: " + identifier);
+    throw std::runtime_error("Table not found or not accessible via shared memory or memory map: " + identifier);
 }
 
 std::string ArrowBridge::create_memory_mapped_file(

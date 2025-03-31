@@ -1,16 +1,16 @@
 # Makevars file for CrossLink R package
 
-# Define path to the pre-built C++ libraries relative to this file (r/Makevars)
-CPP_BUILD_DIR = ../cpp/build
+# Define C++ standard (adjust if needed, e.g., c++17)
+CXX_STD = CXX17
 
-# Flags for the linker
-# -L points to the directory containing the libraries
-# -l links against the specific library (name without 'lib' prefix and '.dylib'/'.so' suffix)
-PKG_LIBS = -L$(CPP_BUILD_DIR) -lcrosslink_r -lcrosslink
+# Compiler flags: Include Rcpp and Arrow headers
+PKG_CPPFLAGS = `$(R_HOME)/bin/Rscript -e "Rcpp:::CxxFlags()"` \
+               `$(R_HOME)/bin/Rscript -e "arrow:::extra_cpp_flags()"` \
+               -I. # Include current directory (src/) for crosslink.h
 
-# Optional: If your C++ code used Rcpp, you might need Rcpp flags
-# PKG_LIBS += $(shell $(R_HOME)/bin/Rscript -e "Rcpp:::LdFlags()")
-# PKG_CPPFLAGS = -I"$(R_HOME)/library/Rcpp/include" $(shell $(R_HOME)/bin/Rscript -e "Rcpp:::CxxFlags()")
+# Linker flags: Link against Rcpp and Arrow libraries
+PKG_LIBS = `$(R_HOME)/bin/Rscript -e "Rcpp:::LdFlags()"` \
+           `$(R_HOME)/bin/Rscript -e "arrow:::extra_ld_flags()"`
 
 # Ensure C++17 is used if needed by your C++ code (might be set by Rcpp flags too)
 # CXX17 = g++

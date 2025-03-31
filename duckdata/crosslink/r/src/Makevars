@@ -1,0 +1,12 @@
+# Location of the core CrossLink library source and build directories
+CROSSLINK_CPP_DIR = ../../cpp
+CROSSLINK_BUILD_DIR = $(CROSSLINK_CPP_DIR)/build
+CROSSLINK_INCLUDE_DIR = $(CROSSLINK_CPP_DIR)/include
+
+# Compiler flags: Add include path for crosslink headers and rely on R for others
+PKG_CPPFLAGS = -I$(CROSSLINK_INCLUDE_DIR) -I../inst/include
+
+# Linker flags: Use R's standard flags (LIBRIS should include Arrow/Rcpp based on LinkingTo)
+# Also add flags for our specific CrossLink library + RPATH
+# Use absolute path for RPATH for libcrosslink.dylib during development
+PKG_LIBS = -L$(CROSSLINK_BUILD_DIR) -lcrosslink -Wl,-rpath,/Users/pranavsateesh/arrow-mage/duckdata/crosslink/cpp/build $$(LIBRIS) $$(LAPACK_LIBS) $$(BLAS_LIBS) $$(FLIBS) 

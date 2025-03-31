@@ -61,13 +61,13 @@ def get_implementation(language=None):
     
     # Return the appropriate implementation
     if language == "python":
-        return _lazy_import("duckdata.pipelink.crosslink.python.crosslink")
+        return _lazy_import("duckdata.crosslink.python.crosslink")
     elif language == "r":
-        return _lazy_import("duckdata.pipelink.crosslink.r.crosslink")
+        return _lazy_import("duckdata.crosslink.r.crosslink")
     elif language == "julia":
-        return _lazy_import("duckdata.pipelink.crosslink.julia.crosslink")
+        return _lazy_import("duckdata.crosslink.julia.crosslink")
     elif language == "cpp":
-        return _lazy_import("duckdata.pipelink.crosslink.cpp.crosslink")
+        return _lazy_import("duckdata.crosslink.cpp.crosslink")
     else:
         raise ValueError(f"Unsupported language: {language}")
 

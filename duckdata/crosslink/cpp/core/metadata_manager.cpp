@@ -88,123 +88,173 @@ void MetadataManager::init_tables() {
 }
 
 void MetadataManager::create_dataset_metadata(const DatasetMetadata& metadata) {
-    try {
-        // First, insert into datasets table
-        auto result = conn_->Query(
-            "INSERT INTO datasets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            metadata.id,
-            metadata.name,
-            metadata.source_language,
-            metadata.created_at,
-            metadata.updated_at,
-            metadata.description,
-            metadata.schema_json,
-            metadata.table_name,
-            metadata.arrow_data,
-            metadata.version,
-            metadata.current_version,
-            metadata.schema_hash,
-            metadata.memory_map_path,
-            metadata.shared_memory_key,
-            metadata.arrow_schema_json,
-            metadata.shared_memory_size,
-            metadata.num_rows,
-            metadata.num_columns,
-            metadata.serialized_size
-        );
-        
-        // Then, insert access languages
-        for (const auto& language : metadata.access_languages) {
-            conn_->Query(
-                "INSERT INTO dataset_access VALUES (?, ?)",
-                metadata.id,
-                language
-            );
+    if (metadata.id.empty()) {
+        throw std::runtime_error("Dataset ID cannot be empty");
+    }
+
+    // Use prepared statements for safety and potential performance benefits
+    auto prepared = conn_->Prepare(R"(
+        INSERT OR REPLACE INTO datasets (
+            id, name, source_language, created_at, updated_at, 
+            description, schema_json, table_name, arrow_data, version, 
+            current_version, schema_hash, memory_map_path, shared_memory_key, 
+            arrow_schema_json, shared_memory_size, num_rows, num_columns, serialized_size
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )");
+
+    if (!prepared->HasError()) {
+        // Start Transaction
+        auto begin_res = conn_->Query("BEGIN TRANSACTION");
+        if (!begin_res || begin_res->HasError()) {
+            throw std::runtime_error("Failed to begin transaction: " + (begin_res ? begin_res->GetError() : "Unknown error"));
         }
-        
-        // Update cache
-        metadata_cache_[metadata.id] = metadata;
-    } catch (const std::exception& e) {
-        throw std::runtime_error("Failed to create dataset metadata: " + std::string(e.what()));
+
+        try {
+            // Execute the prepared statement with metadata values
+            auto result = prepared->Execute(
+                metadata.id,
+                metadata.name,
+                metadata.source_language,
+                metadata.created_at_ts,
+                metadata.updated_at_ts,
+                metadata.description,
+                metadata.schema_json,
+                metadata.table_name,
+                metadata.arrow_data,
+                metadata.version,
+                metadata.current_version,
+                metadata.schema_hash,
+                metadata.memory_map_path,
+                metadata.shared_memory_key,
+                metadata.arrow_schema_json,
+                static_cast<int64_t>(metadata.shared_memory_size),
+                static_cast<int64_t>(metadata.num_rows),
+                static_cast<int32_t>(metadata.num_columns),
+                static_cast<int64_t>(metadata.serialized_size)
+            );
+
+            if (!result || result->HasError()) {
+                throw std::runtime_error("Failed to insert/replace dataset metadata: " + (result ? result->GetError() : "Unknown execution error"));
+            }
+
+            // Commit Transaction
+            auto commit_res = conn_->Query("COMMIT");
+            if (!commit_res || commit_res->HasError()) {
+                // Attempt rollback, though commit failure is serious
+                conn_->Query("ROLLBACK"); 
+                throw std::runtime_error("Failed to commit transaction: " + (commit_res ? commit_res->GetError() : "Unknown error"));
+            }
+
+            // Update cache after successful commit
+            // Use R-value reference and move semantics if DatasetMetadata is movable
+            // Otherwise, copy assignment is fine.
+             std::lock_guard<std::mutex> lock(cache_mutex_); // Protect cache access
+            metadata_cache_[metadata.id] = metadata; 
+            // Also cache by name for faster lookups if name is provided and different from ID
+            if (!metadata.name.empty() && metadata.name != metadata.id) {
+                 metadata_cache_[metadata.name] = metadata;
+            }
+
+        } catch (const std::exception& e) {
+            // Rollback on any exception during execute/commit
+            conn_->Query("ROLLBACK");
+            throw; // Re-throw the exception
+        }
+    } else {
+        throw std::runtime_error("Failed to prepare dataset metadata insert statement: " + prepared->GetError());
+    }
+
+    // Update access languages table (consider transaction?)
+    // Delete existing entries first
+    conn_->Query("DELETE FROM dataset_access WHERE dataset_id = ?", metadata.id);
+    // Insert new entries
+    for (const auto& lang : metadata.access_languages) {
+        conn_->Query("INSERT INTO dataset_access (dataset_id, language) VALUES (?, ?)", metadata.id, lang);
     }
 }
 
 DatasetMetadata MetadataManager::get_dataset_metadata(const std::string& identifier) {
-    // Check if it's in the cache
-    auto cache_it = metadata_cache_.find(identifier);
-    if (cache_it != metadata_cache_.end()) {
-        return cache_it->second;
+    if (identifier.empty()) {
+        throw std::runtime_error("Dataset identifier cannot be empty");
     }
-    
-    try {
-        // Query datasets table
-        auto result = conn_->Query(
-            "SELECT * FROM datasets WHERE id = ? OR name = ?",
-            identifier, identifier
-        );
-        
-        if (result->HasError()) {
-            throw std::runtime_error("Failed to query dataset: " + result->GetError());
+
+    // Check cache first
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_); // Protect cache access
+        auto it = metadata_cache_.find(identifier);
+        if (it != metadata_cache_.end()) {
+            return it->second; // Return cached copy
         }
-        
-        auto &materialized = result->Cast<duckdb::MaterializedQueryResult>();
-        if (materialized.RowCount() == 0) {
-            throw std::runtime_error("Dataset not found: " + identifier);
+    }
+
+    // Not in cache, query the database
+    auto result = conn_->Query(R"(
+        SELECT 
+            id, name, source_language, created_at, updated_at, 
+            description, schema_json, table_name, arrow_data, version, 
+            current_version, schema_hash, memory_map_path, shared_memory_key, 
+            arrow_schema_json, shared_memory_size, num_rows, num_columns, serialized_size
+        FROM datasets 
+        WHERE id = ? OR name = ?
+    )", identifier, identifier);
+
+    if (!result || result->HasError()) {
+        throw std::runtime_error("Failed to query dataset metadata: " + (result ? result->GetError() : "Query execution failed"));
+    }
+
+    auto& materialized = result->Cast<duckdb::MaterializedQueryResult>();
+    if (materialized.RowCount() == 0) {
+        throw std::runtime_error("Dataset not found: " + identifier);
+    }
+    if (materialized.RowCount() > 1) {
+         // This shouldn't happen if id/name constraints are correct, but good to check
+         std::cerr << "Warning: Found multiple metadata entries for identifier: " << identifier << std::endl;
+    }
+
+    // Populate metadata struct from the first row
+    DatasetMetadata metadata;
+    metadata.id = materialized.GetValue(0, 0).ToString();
+    metadata.name = materialized.GetValue(1, 0).ToString();
+    metadata.source_language = materialized.GetValue(2, 0).ToString();
+    metadata.created_at_ts = materialized.GetValue<duckdb::timestamp_t>(3, 0);
+    metadata.updated_at_ts = materialized.GetValue<duckdb::timestamp_t>(4, 0);
+    metadata.created_at = duckdb::Timestamp::ToString(metadata.created_at_ts);
+    metadata.updated_at = duckdb::Timestamp::ToString(metadata.updated_at_ts);
+    metadata.description = materialized.GetValue(5, 0).ToString();
+    metadata.schema_json = materialized.GetValue(6, 0).ToString();
+    metadata.table_name = materialized.GetValue(7, 0).ToString();
+    metadata.arrow_data = materialized.GetValue<bool>(8, 0);
+    metadata.version = materialized.GetValue<int32_t>(9, 0);
+    metadata.current_version = materialized.GetValue<bool>(10, 0);
+    metadata.schema_hash = materialized.GetValue(11, 0).ToString();
+    metadata.memory_map_path = materialized.GetValue(12, 0).ToString();
+    metadata.shared_memory_key = materialized.GetValue(13, 0).ToString();
+    metadata.arrow_schema_json = materialized.GetValue(14, 0).ToString();
+    metadata.shared_memory_size = materialized.GetValue<int64_t>(15, 0);
+    metadata.num_rows = materialized.GetValue<int64_t>(16, 0);
+    metadata.num_columns = materialized.GetValue<int32_t>(17, 0);
+    metadata.serialized_size = materialized.GetValue<int64_t>(18, 0);
+
+    // Retrieve access languages
+    auto access_result = conn_->Query("SELECT language FROM dataset_access WHERE dataset_id = ?", metadata.id);
+    if (access_result && !access_result->HasError()) {
+        auto& access_materialized = access_result->Cast<duckdb::MaterializedQueryResult>();
+        for (const auto& row : access_materialized.Collection().GetRows()) {
+             metadata.access_languages.push_back(row.GetValue(0).ToString());
         }
-        
-        // Extract dataset metadata
-        DatasetMetadata metadata;
-        
-        // Access data using column indices
-        metadata.id = materialized.GetValue(0, 0).ToString();
-        metadata.name = materialized.GetValue(1, 0).ToString();
-        metadata.source_language = materialized.GetValue(2, 0).ToString();
-        metadata.created_at = materialized.GetValue(3, 0).ToString();
-        metadata.updated_at = materialized.GetValue(4, 0).ToString();
-        metadata.description = materialized.GetValue(5, 0).ToString();
-        metadata.schema_json = materialized.GetValue(6, 0).ToString();
-        metadata.table_name = materialized.GetValue(7, 0).ToString();
-        metadata.arrow_data = materialized.GetValue<bool>(8, 0);
-        metadata.version = materialized.GetValue<int>(9, 0);
-        metadata.current_version = materialized.GetValue<bool>(10, 0);
-        metadata.schema_hash = materialized.GetValue(11, 0).ToString();
-        metadata.memory_map_path = materialized.GetValue(12, 0).ToString();
-        metadata.shared_memory_key = materialized.GetValue(13, 0).ToString();
-        metadata.arrow_schema_json = materialized.GetValue(14, 0).ToString();
-        
-        // Get new fields if they exist
-        if (result->ColumnCount() > 15) {
-            metadata.shared_memory_size = materialized.GetValue<int64_t>(15, 0);
-            metadata.num_rows = materialized.GetValue<int64_t>(16, 0);
-            metadata.num_columns = materialized.GetValue<int>(17, 0);
-            metadata.serialized_size = materialized.GetValue<int64_t>(18, 0);
-        }
-        
-        // Get access languages
-        auto access_result = conn_->Query(
-            "SELECT language FROM dataset_access WHERE dataset_id = ?",
-            metadata.id
-        );
-        
-        if (access_result->HasError()) {
-            throw std::runtime_error("Failed to query dataset access: " + access_result->GetError());
-        }
-        
-        auto &materialized_access = access_result->Cast<duckdb::MaterializedQueryResult>();
-        for (size_t i = 0; i < materialized_access.RowCount(); i++) {
-            metadata.access_languages.push_back(materialized_access.GetValue(0, i).ToString());
-        }
-        
-        // Update cache
+    }
+
+    // Update cache
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_); // Protect cache access
         metadata_cache_[metadata.id] = metadata;
-        if (!metadata.name.empty()) {
+        // Also cache by name if different
+        if (!metadata.name.empty() && metadata.name != metadata.id) {
             metadata_cache_[metadata.name] = metadata;
         }
-        
-        return metadata;
-    } catch (const std::exception& e) {
-        throw std::runtime_error("Failed to get dataset metadata: " + std::string(e.what()));
     }
+
+    return metadata;
 }
 
 std::vector<std::string> MetadataManager::list_datasets() {
