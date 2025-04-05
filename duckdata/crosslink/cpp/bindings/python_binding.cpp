@@ -3,6 +3,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/chrono.h>
 #include "../include/crosslink.h"
+#include "../core/crosslink_config.h"
 #include <arrow/python/pyarrow.h>
 #include <utility>
 
@@ -74,6 +75,45 @@ PYBIND11_MODULE(crosslink_cpp, m) {
         throw std::runtime_error("Failed to initialize PyArrow integration");
     }
 
+    // === Bind Operation Mode Enum ===
+    py::enum_<crosslink::OperationMode>(m, "OperationMode")
+        .value("LOCAL", crosslink::OperationMode::LOCAL)
+        .value("DISTRIBUTED", crosslink::OperationMode::DISTRIBUTED)
+        .export_values();
+
+    // === Bind CrossLinkConfig ===
+    py::class_<crosslink::CrossLinkConfig>(m, "CrossLinkConfig")
+        .def(py::init<const std::string&, bool, crosslink::OperationMode, 
+                      const std::string&, int, const std::string&, int, const std::string&>(),
+             py::arg("db_path") = "crosslink.duckdb",
+             py::arg("debug") = false,
+             py::arg("mode") = crosslink::OperationMode::LOCAL,
+             py::arg("flight_host") = "localhost",
+             py::arg("flight_port") = 8815,
+             py::arg("mother_node_address") = "",
+             py::arg("mother_node_port") = 8815,
+             py::arg("node_address") = "",
+             "Create a new CrossLinkConfig")
+        .def_static("from_env", &crosslink::CrossLinkConfig::from_env,
+                   "Create a CrossLinkConfig from environment variables")
+        .def("db_path", &crosslink::CrossLinkConfig::db_path, "Get the database path")
+        .def("debug", &crosslink::CrossLinkConfig::debug, "Get the debug flag")
+        .def("mode", &crosslink::CrossLinkConfig::mode, "Get the operation mode")
+        .def("flight_host", &crosslink::CrossLinkConfig::flight_host, "Get the Flight host")
+        .def("flight_port", &crosslink::CrossLinkConfig::flight_port, "Get the Flight port")
+        .def("mother_node_address", &crosslink::CrossLinkConfig::mother_node_address, "Get the mother node address")
+        .def("mother_node_port", &crosslink::CrossLinkConfig::mother_node_port, "Get the mother node port")
+        .def("node_address", &crosslink::CrossLinkConfig::node_address, "Get the node address")
+        .def("set_db_path", &crosslink::CrossLinkConfig::set_db_path, py::arg("db_path"), "Set the database path")
+        .def("set_debug", &crosslink::CrossLinkConfig::set_debug, py::arg("debug"), "Set the debug flag")
+        .def("set_mode", &crosslink::CrossLinkConfig::set_mode, py::arg("mode"), "Set the operation mode")
+        .def("set_flight_host", &crosslink::CrossLinkConfig::set_flight_host, py::arg("flight_host"), "Set the Flight host")
+        .def("set_flight_port", &crosslink::CrossLinkConfig::set_flight_port, py::arg("flight_port"), "Set the Flight port")
+        .def("set_mother_node_address", &crosslink::CrossLinkConfig::set_mother_node_address, py::arg("mother_node_address"), "Set the mother node address")
+        .def("set_mother_node_port", &crosslink::CrossLinkConfig::set_mother_node_port, py::arg("mother_node_port"), "Set the mother node port")
+        .def("set_node_address", &crosslink::CrossLinkConfig::set_node_address, py::arg("node_address"), "Set the node address")
+        .def("is_valid_distributed_config", &crosslink::CrossLinkConfig::is_valid_distributed_config, "Check if the configuration is valid for distributed mode");
+
     // === Bind StreamWriter ===
     py::class_<crosslink::StreamWriter, std::shared_ptr<crosslink::StreamWriter>>(m, "StreamWriter")
         .def("write_batch", [](crosslink::StreamWriter& self, py::object py_batch) {
@@ -135,7 +175,10 @@ PYBIND11_MODULE(crosslink_cpp, m) {
         .def(py::init<const std::string&, bool>(),
              py::arg("db_path") = "crosslink.duckdb",
              py::arg("debug") = false,
-             "Initialize the CrossLink C++ core.")
+             "Initialize the CrossLink C++ core with database path and debug flag.")
+        .def(py::init<const crosslink::CrossLinkConfig&>(),
+             py::arg("config"),
+             "Initialize the CrossLink C++ core with a configuration object.")
 
         // --- Batch Methods ---
         .def("push", [](crosslink::CrossLink& self, py::object py_table,
@@ -158,6 +201,41 @@ PYBIND11_MODULE(crosslink_cpp, m) {
 
         .def("list_datasets", &crosslink::CrossLink::list_datasets,
              "List available batch datasets.")
+
+        // --- Flight Methods ---
+        .def("flight_push", [](crosslink::CrossLink& self, py::object py_table,
+                               const std::string& remote_host, int remote_port,
+                               const std::string& name, const std::string& description) {
+            auto table = python_table_to_cpp(py_table);
+            return self.flight_push(table, remote_host, remote_port, name, description);
+        }, py::arg("table"), py::arg("remote_host"), py::arg("remote_port"),
+           py::arg("name") = "", py::arg("description") = "",
+           "Push a pyarrow.Table to a remote Flight server.")
+
+        .def("flight_pull", [](crosslink::CrossLink& self, const std::string& identifier,
+                              const std::string& remote_host, int remote_port) {
+            auto table = self.flight_pull(identifier, remote_host, remote_port);
+            return cpp_table_to_python(table);
+        }, py::arg("identifier"), py::arg("remote_host"), py::arg("remote_port"),
+           "Pull a shared batch dataset from a remote Flight server as a pyarrow.Table.")
+
+        .def("list_remote_datasets", &crosslink::CrossLink::list_remote_datasets,
+             py::arg("remote_host"), py::arg("remote_port"),
+             "List available datasets on a remote Flight server.")
+
+        .def("start_flight_server", &crosslink::CrossLink::start_flight_server,
+             "Start the Flight server for distributed mode.")
+
+        .def("stop_flight_server", &crosslink::CrossLink::stop_flight_server,
+             "Stop the Flight server.")
+
+        .def("flight_server_port", &crosslink::CrossLink::flight_server_port,
+             "Get the port of the running Flight server.")
+
+        .def("config", [](crosslink::CrossLink& self) -> const crosslink::CrossLinkConfig& {
+            return self.config();
+        }, py::return_value_policy::reference_internal,
+           "Get the current configuration.")
 
         // --- Streaming Methods ---
         .def("push_stream", [](crosslink::CrossLink& self, py::object py_schema, const std::string& name) {

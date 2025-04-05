@@ -11,6 +11,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 # Find required dependencies
 find_package(Arrow REQUIRED)
+find_package(ArrowFlight REQUIRED)
 find_package(DuckDB REQUIRED)
 
 # Add link directories for libraries
@@ -23,6 +24,9 @@ add_library(crosslink_core SHARED
     core/arrow_bridge.cpp
     core/metadata_manager.cpp
     core/notification_system.cpp
+    core/flight_client.cpp
+    core/flight_server.cpp
+    core/crosslink_config.cpp
 )
 
 # Setup include directories
@@ -30,12 +34,14 @@ target_include_directories(crosslink_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${Arrow_INCLUDE_DIRS}
+    ${ArrowFlight_INCLUDE_DIRS}
     ${DuckDB_INCLUDE_DIRS}
 )
 
 # Link with dependencies
 target_link_libraries(crosslink_core PUBLIC
     Arrow::arrow_shared
+    ArrowFlight::arrow_flight_shared
     ${DuckDB_LIBRARIES}
 )
 
@@ -249,4 +255,4 @@ install(TARGETS crosslink_core
 )
 
 # Add examples
-# add_subdirectory(examples) 
+add_subdirectory(examples) 

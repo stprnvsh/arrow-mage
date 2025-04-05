@@ -3,6 +3,9 @@
 #include "../core/metadata_manager.h"
 #include "../core/notification_system.h"
 #include "../core/shared_memory_manager.h"
+#include "../core/crosslink_config.h"
+#include "../core/flight_client.h"
+#include "../core/flight_server.h"
 #include <duckdb.hpp>
 #include <iostream>
 #include <map>
@@ -165,13 +168,37 @@ public:
 // Implementation class
 class CrossLink::Impl {
 public:
-    Impl(const std::string& db_path, bool debug)
-        : db_path_(db_path), debug_(debug), metadata_manager_(db_path) {
+    Impl(const CrossLinkConfig& config)
+        : config_(config), db_path_(config.db_path()), debug_(config.debug()), 
+          metadata_manager_(config.db_path()) {
         
         if (debug_) {
-            std::cout << "CrossLink initialized with database: " << db_path << std::endl;
+            std::cout << "CrossLink initialized with database: " << db_path_ << std::endl;
+            if (config_.mode() == OperationMode::DISTRIBUTED) {
+                std::cout << "CrossLink running in distributed mode" << std::endl;
+                std::cout << "Flight server configured on " << config_.flight_host() 
+                        << ":" << config_.flight_port() << std::endl;
+                if (!config_.mother_node_address().empty()) {
+                    std::cout << "Mother node at " << config_.mother_node_address() 
+                            << ":" << config_.mother_node_port() << std::endl;
+                }
+                if (!config_.node_address().empty()) {
+                    std::cout << "Node address: " << config_.node_address() << std::endl;
+                }
+            } else {
+                std::cout << "CrossLink running in local mode" << std::endl;
+            }
+        }
+        
+        // Start the Flight server if in distributed mode
+        if (config_.mode() == OperationMode::DISTRIBUTED) {
+            start_flight_server();
         }
     }
+    
+    // Constructor overload for backward compatibility
+    Impl(const std::string& db_path, bool debug)
+        : Impl(CrossLinkConfig(db_path, debug)) {}
     
     ~Impl() {
         cleanup();
@@ -402,6 +429,9 @@ public:
         
         // Clean up shared memory regions
         SharedMemoryManager::instance().cleanup_all();
+        
+        // Stop Flight server if running
+        stop_flight_server();
     }
     
     // === New Streaming Methods ===
@@ -455,13 +485,239 @@ public:
         return reader; // Return type matches now
     }
 
+    // Start the Flight server
+    bool start_flight_server() {
+        try {
+            if (flight_server_) {
+                if (debug_) {
+                    std::cout << "Flight server already running" << std::endl;
+                }
+                return true; // Already running
+            }
+            
+            if (debug_) {
+                std::cout << "Starting Flight server on " << config_.flight_host() 
+                      << ":" << config_.flight_port() << std::endl;
+            }
+            
+            // Initialize the flight server
+            auto status = FlightServer::Initialize(
+                config_.flight_host(), config_.flight_port(),
+                metadata_manager_, db_path_, &flight_server_);
+            
+            if (!status.ok()) {
+                if (debug_) {
+                    std::cerr << "Failed to initialize Flight server: " 
+                          << status.ToString() << std::endl;
+                }
+                return false;
+            }
+            
+            // Start the server
+            status = flight_server_->StartAsync();
+            if (!status.ok()) {
+                if (debug_) {
+                    std::cerr << "Failed to start Flight server: " 
+                          << status.ToString() << std::endl;
+                }
+                flight_server_.reset();
+                return false;
+            }
+            
+            if (debug_) {
+                std::cout << "Flight server started on port " << flight_server_->port() << std::endl;
+            }
+            
+            return true;
+        } catch (const std::exception& e) {
+            if (debug_) {
+                std::cerr << "Error starting Flight server: " << e.what() << std::endl;
+            }
+            return false;
+        }
+    }
+    
+    // Stop the Flight server
+    bool stop_flight_server() {
+        try {
+            if (!flight_server_) {
+                return true; // Already stopped
+            }
+            
+            if (debug_) {
+                std::cout << "Stopping Flight server" << std::endl;
+            }
+            
+            auto status = flight_server_->Stop();
+            if (!status.ok()) {
+                if (debug_) {
+                    std::cerr << "Failed to stop Flight server: " 
+                          << status.ToString() << std::endl;
+                }
+                return false;
+            }
+            
+            flight_server_.reset();
+            if (debug_) {
+                std::cout << "Flight server stopped" << std::endl;
+            }
+            
+            return true;
+        } catch (const std::exception& e) {
+            if (debug_) {
+                std::cerr << "Error stopping Flight server: " << e.what() << std::endl;
+            }
+            return false;
+        }
+    }
+    
+    // Get the port of the running Flight server
+    int flight_server_port() const {
+        return flight_server_ ? flight_server_->port() : -1;
+    }
+    
+    // Share a table via Flight to a remote node
+    std::string flight_push(std::shared_ptr<arrow::Table> table,
+                          const std::string& remote_host,
+                          int remote_port,
+                          const std::string& name,
+                          const std::string& description) {
+        try {
+            if (debug_) {
+                std::cout << "Pushing table via Flight to " << remote_host << ":" << remote_port
+                      << " (" << table->num_rows() << " rows, " 
+                      << table->num_columns() << " columns)" << std::endl;
+            }
+            
+            // Create a dataset ID for this table
+            std::string dataset_id = name.empty() ? 
+                ArrowBridge::generate_uuid() :
+                name;
+            
+            // Connect to the remote Flight server
+            std::unique_ptr<FlightClient> client;
+            auto status = FlightClient::Initialize(remote_host, remote_port, &client);
+            if (!status.ok()) {
+                throw std::runtime_error("Failed to connect to Flight server: " + 
+                                        status.ToString());
+            }
+            
+            // Put the table
+            status = client->PutDataset(dataset_id, table);
+            if (!status.ok()) {
+                throw std::runtime_error("Failed to put dataset via Flight: " + 
+                                        status.ToString());
+            }
+            
+            if (debug_) {
+                std::cout << "Table pushed successfully via Flight with ID: " 
+                      << dataset_id << std::endl;
+            }
+            
+            return dataset_id;
+        } catch (const std::exception& e) {
+            if (debug_) {
+                std::cerr << "Error pushing table via Flight: " << e.what() << std::endl;
+            }
+            throw;
+        }
+    }
+    
+    // Get a table via Flight from a remote node
+    std::shared_ptr<arrow::Table> flight_pull(const std::string& identifier,
+                                            const std::string& remote_host,
+                                            int remote_port) {
+        try {
+            if (debug_) {
+                std::cout << "Pulling table via Flight from " << remote_host << ":" 
+                      << remote_port << " (ID: " << identifier << ")" << std::endl;
+            }
+            
+            // Connect to the remote Flight server
+            std::unique_ptr<FlightClient> client;
+            auto status = FlightClient::Initialize(remote_host, remote_port, &client);
+            if (!status.ok()) {
+                throw std::runtime_error("Failed to connect to Flight server: " + 
+                                        status.ToString());
+            }
+            
+            // Get the table
+            std::shared_ptr<arrow::Table> table;
+            status = client->GetDataset(identifier, &table);
+            if (!status.ok()) {
+                throw std::runtime_error("Failed to get dataset via Flight: " + 
+                                        status.ToString());
+            }
+            
+            if (debug_) {
+                std::cout << "Table pulled successfully via Flight: " 
+                      << table->num_rows() << " rows, "
+                      << table->num_columns() << " columns" << std::endl;
+            }
+            
+            return table;
+        } catch (const std::exception& e) {
+            if (debug_) {
+                std::cerr << "Error pulling table via Flight: " << e.what() << std::endl;
+            }
+            throw;
+        }
+    }
+    
+    // List available datasets on a remote Flight server
+    std::vector<std::string> list_remote_datasets(const std::string& remote_host,
+                                               int remote_port) {
+        try {
+            if (debug_) {
+                std::cout << "Listing datasets via Flight from " << remote_host << ":" 
+                      << remote_port << std::endl;
+            }
+            
+            // Connect to the remote Flight server
+            std::unique_ptr<FlightClient> client;
+            auto status = FlightClient::Initialize(remote_host, remote_port, &client);
+            if (!status.ok()) {
+                throw std::runtime_error("Failed to connect to Flight server: " + 
+                                        status.ToString());
+            }
+            
+            // List datasets
+            std::vector<std::string> dataset_ids;
+            status = client->ListDatasets(&dataset_ids);
+            if (!status.ok()) {
+                throw std::runtime_error("Failed to list datasets via Flight: " + 
+                                        status.ToString());
+            }
+            
+            if (debug_) {
+                std::cout << "Listed " << dataset_ids.size() 
+                      << " datasets via Flight" << std::endl;
+            }
+            
+            return dataset_ids;
+        } catch (const std::exception& e) {
+            if (debug_) {
+                std::cerr << "Error listing datasets via Flight: " << e.what() << std::endl;
+            }
+            throw;
+        }
+    }
+    
+    // Get current configuration
+    const CrossLinkConfig& config() const {
+        return config_;
+    }
+
 private:
+    CrossLinkConfig config_;
     std::string db_path_;
     bool debug_;
     MetadataManager metadata_manager_;
-    // Existing members for batch/metadata etc.
-
-    // === New Members for Streaming ===
+    
+    // Flight components
+    std::unique_ptr<FlightServer> flight_server_;
+    
+    // Stream registry
     std::map<std::string, std::shared_ptr<StreamState>> stream_registry_;
     std::mutex stream_registry_mutex_; // Protects access to stream_registry_
 };
@@ -469,6 +725,10 @@ private:
 // CrossLink implementation that delegates to Impl
 CrossLink::CrossLink(const std::string& db_path, bool debug)
     : impl_(std::make_unique<Impl>(db_path, debug)) {
+}
+
+CrossLink::CrossLink(const CrossLinkConfig& config)
+    : impl_(std::make_unique<Impl>(config)) {
 }
 
 CrossLink::~CrossLink() = default;
@@ -514,6 +774,42 @@ void CrossLink::unregister_notification(const std::string& registration_id) {
 
 void CrossLink::cleanup() {
     impl_->cleanup();
+}
+
+// Flight API implementations
+std::string CrossLink::flight_push(std::shared_ptr<arrow::Table> table,
+                                  const std::string& remote_host,
+                                  int remote_port,
+                                  const std::string& name,
+                                  const std::string& description) {
+    return impl_->flight_push(table, remote_host, remote_port, name, description);
+}
+
+std::shared_ptr<arrow::Table> CrossLink::flight_pull(const std::string& identifier,
+                                                   const std::string& remote_host,
+                                                   int remote_port) {
+    return impl_->flight_pull(identifier, remote_host, remote_port);
+}
+
+std::vector<std::string> CrossLink::list_remote_datasets(const std::string& remote_host,
+                                                       int remote_port) {
+    return impl_->list_remote_datasets(remote_host, remote_port);
+}
+
+bool CrossLink::start_flight_server() {
+    return impl_->start_flight_server();
+}
+
+bool CrossLink::stop_flight_server() {
+    return impl_->stop_flight_server();
+}
+
+int CrossLink::flight_server_port() const {
+    return impl_->flight_server_port();
+}
+
+const CrossLinkConfig& CrossLink::config() const {
+    return impl_->config();
 }
 
 } // namespace crosslink 
