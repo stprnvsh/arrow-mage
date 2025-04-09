@@ -1,1 +1,14 @@
 # Add directories or file patterns to ignore during indexing (e.g. foo/ or *.csv)
+*
+!*/
+!*.h
+!*.cpp
+!*.py
+!*.json
+!*.ipynb
+!*.md
+!*.txt
+!*.sh
+!*.cmake
+!*.toml
+!*.docx

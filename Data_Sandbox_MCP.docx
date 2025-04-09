@@ -1,0 +1,176 @@
+# Data Sandbox MCP Documentation
+
+## Overview
+
+The Data Sandbox is a versatile data analysis application that combines the power of ArrowCache with Claude AI to provide a comprehensive environment for data exploration, querying, and visualization. This document serves as a model control protocol (MCP) reference for AI assistants to understand the application's capabilities and routes.
+
+## Core Components
+
+### 1. Data Management
+- **Supported Formats**: CSV, Parquet, Arrow, Feather, JSON, Excel, GeoJSON (optional), GeoParquet (optional)
+- **Data Loading Methods**: 
+  - Upload local files
+  - Import from URL
+  - Load sample datasets (NYC Yellow Taxi, Titanic, Iris, US Housing)
+- **Data Operations**:
+  - View and browse datasets
+  - Remove datasets
+  - Inspect metadata (rows, columns, memory usage)
+
+### 2. SQL Query Engine
+- **Backend**: Uses DuckDB for SQL querying
+- **Table Access Pattern**: `FROM _cache_<dataset_name>`
+- **SQL Features**:
+  - Standard SQL operations (SELECT, WHERE, GROUP BY, ORDER BY, etc.)
+  - Window functions
+  - Aggregations
+  - Joins between datasets
+  - Subqueries
+
+### 3. Natural Language Interface (Claude AI)
+- **Query Pattern**: Ask questions in natural language → Get SQL + results
+- **Capabilities**:
+  - Translate natural language to SQL
+  - Execute generated SQL
+  - Interpret results accurately (using a two-step process)
+  - Show visualizations on request
+  - Maintain conversation context
+
+### 4. Visualization Tools
+- **Plot Types**: Line, Bar, Scatter, Histogram, Box, Pie
+- **Customization**: Title, size, DPI
+- **Output**: Rendered as embedded images
+
+## Command Routes and Patterns
+
+### Dataset Loading
+- **Local Upload**:
+  1. Navigate to Datasets tab
+  2. Use "Upload File" section
+  3. Select file + specify format (optional)
+  4. Configure advanced options if needed (e.g., CSV delimiter)
+
+- **URL Import**:
+  1. Navigate to Datasets tab
+  2. Use "From URL" section
+  3. Enter URL and dataset name (optional)
+  4. Configure format and options
+
+- **Sample Datasets**:
+  1. Navigate to Datasets tab
+  2. Use "Sample Data" section
+  3. Select from predefined samples
+
+### SQL Querying
+- **Direct SQL**:
+  1. Navigate to SQL Query tab
+  2. Write SQL using `FROM _cache_<dataset_name>` syntax
+  3. Execute query
+
+- **Natural Language Queries**:
+  1. Navigate to Ask Claude tab
+  2. Enter question in natural language
+  3. Claude will:
+     - Generate appropriate SQL
+     - Execute the query
+     - Interpret results
+     - Provide visualizations if requested
+
+### Visualization
+- **Creating Visualizations**:
+  1. Navigate to Visualize tab
+  2. Select dataset
+  3. Configure X-axis, Y-axis, and plot type
+  4. Set advanced options (title, dimensions)
+  5. Generate plot
+
+## Memory Management
+- **ArrowCache Configuration**:
+  - Memory limit: 10GB
+  - Disk spilling: Enabled
+  - Compression: LZ4
+  - Dictionary encoding: Enabled
+  - Auto-partitioning: Enabled
+
+- **Memory Usage Tracking**:
+  - Displays current usage vs. limit
+  - Reports per-dataset memory consumption
+  - Shows utilization percentage
+
+## API Integration
+- **Claude API**:
+  - API key configuration in sidebar or Claude tab
+  - Uses Claude 3 Opus model
+  - Two-step querying process:
+    1. Generate SQL from natural language
+    2. Interpret results based on actual query output
+
+## Best Practices for Models/Agents
+
+1. **Dataset Exploration**:
+   - Always check available datasets first
+   - Review column names and data types before suggesting queries
+   - Consider dataset size when recommending operations
+
+2. **SQL Query Generation**:
+   - Use correct table name format: `_cache_<dataset_name>`
+   - Start with simpler queries and increase complexity
+   - Limit results for large datasets
+   - Suggest appropriate JOINs when relationships exist
+
+3. **Results Interpretation**:
+   - Reference exact numbers from results
+   - Highlight trends and patterns
+   - Suggest follow-up queries when appropriate
+
+4. **Visualization Recommendations**:
+   - Suggest appropriate chart types for data:
+     - Line: Time series, trends
+     - Bar: Categories, comparisons
+     - Scatter: Relationships, correlations
+     - Histogram: Distributions
+     - Box: Statistical summaries
+     - Pie: Part-to-whole relationships
+
+5. **Memory Awareness**:
+   - Consider dataset size for large operations
+   - Recommend filtering or sampling for very large datasets
+
+## Example Workflows
+
+### Exploratory Data Analysis
+1. Load dataset (e.g., NYC Taxi data)
+2. Ask: "What columns are available in the NYC Taxi dataset?"
+3. Ask: "Show summary statistics for fare_amount"
+4. Ask: "What's the relationship between trip_distance and fare_amount?"
+5. Create scatter plot of trip_distance vs fare_amount
+
+### Time Series Analysis
+1. Load dataset with timestamp column
+2. Ask: "Show average [metric] by hour of day"
+3. Ask: "Which day of the week has highest [metric]?"
+4. Create line chart showing trend over time
+
+### Comparative Analysis
+1. Load multiple related datasets
+2. Ask: "Compare average [metric] between datasets"
+3. Create bar charts for visual comparison
+
+## Troubleshooting
+- **Dataset Not Loading**: Check format, file size, memory limits
+- **Query Errors**: Verify column names, syntax, table references
+- **Visualization Issues**: Ensure appropriate data types for chosen plot
+
+## Technical Details
+
+### Dataset Storage
+- In-memory with disk spilling
+- Metadata tracking for efficient querying
+- Column-wise storage with compression
+
+### Query Execution
+- DuckDB compilation and optimization
+- Results cached for efficient reuse
+- Pandas DataFrame output format
+
+This MCP document provides a comprehensive understanding of the Data Sandbox application's capabilities, enabling AI assistants to effectively guide users through data exploration, analysis, and visualization tasks. 

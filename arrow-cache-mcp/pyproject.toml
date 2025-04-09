@@ -1,0 +1,17 @@
+[project]
+name = "arrow-cache-mcp"
+version = "0.1"
+description = "DataScience MCP"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [ "mcp>=1.6.0", ]
+[[project.authors]]
+name = "stprnvsh"
+email = "141918471+stprnvsh@users.noreply.github.com"
+
+[build-system]
+requires = [ "hatchling",]
+build-backend = "hatchling.build"
+
+[project.scripts]
+arrow-cache-mcp = "arrow_cache_mcp:main"

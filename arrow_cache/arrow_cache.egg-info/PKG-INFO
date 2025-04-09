@@ -1,0 +1,20 @@
+Metadata-Version: 2.4
+Name: arrow_cache
+Version: 0.1.0
+Summary: High-performance caching system using Apache Arrow and DuckDB
+Author: Pranav Sateesh
+Requires-Python: >=3.8
+Requires-Dist: pyarrow>=10.0.0
+Requires-Dist: duckdb>=0.7.0
+Requires-Dist: pandas>=1.0.0
+Requires-Dist: numpy>=1.20.0
+Provides-Extra: geo
+Requires-Dist: geopandas>=0.9.0; extra == "geo"
+Requires-Dist: pyogrio>=0.4.0; extra == "geo"
+Provides-Extra: parquet
+Requires-Dist: pyarrow-parquet>=10.0.0; extra == "parquet"
+Dynamic: author
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
