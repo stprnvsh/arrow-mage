@@ -12,6 +12,7 @@ import time
 import concurrent.futures
 from typing import Dict, List, Set, Optional, Any, Callable, Tuple, Union, TypeVar, Generic
 import traceback
+import pyarrow as pa
 
 logger = logging.getLogger(__name__)
 
@@ -492,4 +493,107 @@ def parallel_map(
         max_workers = min(32, os.cpu_count() + 4)
         
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        return list(executor.map(fn, items, chunksize=chunk_size, timeout=timeout)) 
+        return list(executor.map(fn, items, chunksize=chunk_size, timeout=timeout))
+
+def process_arrow_batches_parallel(
+    fn: Callable[[pa.RecordBatch], pa.RecordBatch],
+    table: pa.Table, 
+    max_workers: Optional[int] = None,
+    max_rows_per_batch: int = 100000
+) -> pa.Table:
+    """
+    Process an Arrow table in parallel using record batches
+    
+    Args:
+        fn: Function to execute on each batch
+        table: Arrow table to process
+        max_workers: Maximum number of worker threads (None for default)
+        max_rows_per_batch: Maximum rows per batch
+        
+    Returns:
+        New Arrow table with processed data
+    """
+    if table.num_rows == 0:
+        return table
+    
+    # Create batches
+    total_rows = table.num_rows
+    
+    # Adjust batch size based on thread count for better parallelism
+    if max_workers is None:
+        max_workers = min(32, os.cpu_count() + 4)
+    
+    # Target at least 2-4 batches per thread for better utilization
+    target_batch_count = max_workers * 3
+    adjusted_rows_per_batch = max(1000, min(max_rows_per_batch, 
+                                          total_rows // target_batch_count))
+    
+    num_batches = (total_rows + adjusted_rows_per_batch - 1) // adjusted_rows_per_batch
+    
+    # Create record batches
+    batches = []
+    for i in range(num_batches):
+        start = i * adjusted_rows_per_batch
+        end = min(start + adjusted_rows_per_batch, total_rows)
+        # Use slice and to_batches to efficiently create record batches
+        batch = table.slice(start, end - start).to_batches()[0]
+        batches.append(batch)
+    
+    # Process batches in parallel
+    processed_batches = parallel_map(fn, batches, max_workers=max_workers)
+    
+    # Combine processed batches back into a table
+    return pa.Table.from_batches(processed_batches)
+
+def apply_arrow_compute_parallel(
+    compute_fn: Callable[[pa.ChunkedArray], pa.ChunkedArray],
+    table: pa.Table,
+    column_names: List[str],
+    max_workers: Optional[int] = None
+) -> pa.Table:
+    """
+    Apply Arrow compute function to multiple columns in parallel
+    
+    Args:
+        compute_fn: Arrow compute function to apply to columns
+        table: Arrow table
+        column_names: Names of columns to process
+        max_workers: Maximum number of worker threads
+        
+    Returns:
+        New Arrow table with processed columns
+    """
+    if not column_names:
+        return table
+    
+    if max_workers is None:
+        max_workers = min(32, os.cpu_count() + 4)
+    
+    # Process columns in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Create tasks for processing each column
+        column_tasks = {
+            executor.submit(compute_fn, table[col]): col 
+            for col in column_names if col in table.column_names
+        }
+        
+        # Create new columns dict with processed and unprocessed columns
+        new_columns = {}
+        for col in table.column_names:
+            if col in column_names:
+                continue  # Will be added from tasks
+            new_columns[col] = table[col]
+        
+        # Get results from tasks
+        for future in concurrent.futures.as_completed(column_tasks):
+            col_name = column_tasks[future]
+            try:
+                new_columns[col_name] = future.result()
+            except Exception as e:
+                logger.error(f"Error processing column {col_name}: {e}")
+                # Keep original column on error
+                new_columns[col_name] = table[col_name]
+        
+        # Create new table with all columns
+        columns = [new_columns[name] for name in table.column_names]
+        return pa.Table.from_arrays(columns, names=table.column_names) 

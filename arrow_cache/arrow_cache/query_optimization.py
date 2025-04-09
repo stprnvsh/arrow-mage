@@ -11,7 +11,7 @@ import logging
 import re
 import threading
 import time
-from typing import Dict, List, Set, Optional, Any, Tuple, Union
+from typing import Dict, List, Set, Optional, Any, Tuple, Union, Callable
 from dataclasses import dataclass
 import functools
 import json
@@ -165,6 +165,12 @@ class QueryOptimizer:
         optimization_hints = []
         optimized_sql = sql
         
+        # Fix date/time function compatibility issues
+        optimized_sql = self._fix_date_functions(optimized_sql)
+        
+        # Fix table references that look like function calls
+        optimized_sql = self._fix_table_references(optimized_sql)
+        
         # Check for optimization opportunities using regex patterns
         for name, pattern_info in self._hint_patterns.items():
             pattern = pattern_info["pattern"]
@@ -190,6 +196,159 @@ class QueryOptimizer:
                     optimization_hints.append(f"Set thread count to {thread_count} for parallel execution")
         
         return optimized_sql, optimization_hints
+    
+    def _fix_date_functions(self, sql: str) -> str:
+        """
+        Fix compatibility issues with date/time functions
+        
+        Args:
+            sql: Original SQL query
+            
+        Returns:
+            SQL query with fixed date/time functions
+        """
+        original_sql = sql
+        
+        # Fix EXTRACT(DAYOFWEEK FROM ...) -> EXTRACT(dow FROM ...)
+        sql = re.sub(
+            r'EXTRACT\s*\(\s*DAYOFWEEK\s+FROM\s+([^)]+)\)',
+            r'EXTRACT(dow FROM \1)',
+            sql,
+            flags=re.IGNORECASE
+        )
+        
+        # Fix date_part('DAYOFWEEK', ...) -> date_part('dow', ...)
+        sql = re.sub(
+            r"date_part\s*\(\s*'DAYOFWEEK'\s*,\s*([^)]+)\)",
+            r"date_part('dow', \1)",
+            sql,
+            flags=re.IGNORECASE
+        )
+        sql = re.sub(
+            r'date_part\s*\(\s*"DAYOFWEEK"\s*,\s*([^)]+)\)',
+            r'date_part("dow", \1)',
+            sql,
+            flags=re.IGNORECASE
+        )
+        
+        # Fix other common date format inconsistencies
+        # DAYOFMONTH -> day
+        sql = re.sub(
+            r'EXTRACT\s*\(\s*DAYOFMONTH\s+FROM\s+([^)]+)\)',
+            r'EXTRACT(day FROM \1)',
+            sql,
+            flags=re.IGNORECASE
+        )
+        
+        # DAYOFYEAR -> doy
+        sql = re.sub(
+            r'EXTRACT\s*\(\s*DAYOFYEAR\s+FROM\s+([^)]+)\)',
+            r'EXTRACT(doy FROM \1)',
+            sql,
+            flags=re.IGNORECASE
+        )
+        
+        # WEEKDAY -> dow
+        sql = re.sub(
+            r'EXTRACT\s*\(\s*WEEKDAY\s+FROM\s+([^)]+)\)',
+            r'EXTRACT(dow FROM \1)',
+            sql,
+            flags=re.IGNORECASE
+        )
+        
+        # Handle type casting for common timestamp columns
+        # This helps with VARCHAR columns that need to be interpreted as timestamps
+        # Look for date functions on pickup_datetime, dropoff_datetime, etc.
+        for date_col in ['pickup_datetime', 'dropoff_datetime', 'created_at', 'timestamp', 'date', 'time']:
+            # Add explicit CAST for EXTRACT function
+            sql = re.sub(
+                rf'EXTRACT\s*\(\s*(\w+)\s+FROM\s+{date_col}\b([^)]*)?\)',
+                rf'EXTRACT(\1 FROM CAST({date_col} AS TIMESTAMP)\2)',
+                sql,
+                flags=re.IGNORECASE
+            )
+            
+            # Add explicit CAST for date_part function
+            sql = re.sub(
+                rf"date_part\s*\(\s*'(\w+)'\s*,\s*{date_col}\b([^)]*)?\)",
+                rf"date_part('\1', CAST({date_col} AS TIMESTAMP)\2)",
+                sql,
+                flags=re.IGNORECASE
+            )
+            sql = re.sub(
+                rf'date_part\s*\(\s*"(\w+)"\s*,\s*{date_col}\b([^)]*)?\)',
+                rf'date_part("\1", CAST({date_col} AS TIMESTAMP)\2)',
+                sql,
+                flags=re.IGNORECASE
+            )
+            
+        # Add explicit TIMESTAMP type for date literals in comparisons
+        sql = re.sub(
+            r"(\b\w+_datetime\b|\bdatetime\b|\btimestamp\b|\bdate\b|\btime\b)\s*([=><]+)\s*'(\d{4}-\d{2}-\d{2}[^']*)'",
+            r"\1 \2 TIMESTAMP '\3'",
+            sql,
+            flags=re.IGNORECASE
+        )
+        
+        # Log if any changes were made
+        if sql != original_sql:
+            logger.info("Fixed date/time function compatibility issues in SQL query")
+            logger.debug(f"Original SQL: {original_sql}")
+            logger.debug(f"Fixed SQL: {sql}")
+        
+        return sql
+    
+    def _fix_table_references(self, sql: str) -> str:
+        """
+        Fix table references that DuckDB might misinterpret as function calls
+        
+        Args:
+            sql: Original SQL query
+            
+        Returns:
+            SQL query with fixed table references
+        """
+        original_sql = sql
+        
+        # Pattern to match table references that look like function calls
+        # like "_cache_nyc_yellow_taxi_(jan_2023)" or "_cache_nyc_yellow_taxi_ (jan_2023)"
+        # Updated regex to better handle spaces before parentheses
+        pattern = re.compile(r'(FROM|JOIN)\s+(_cache_[a-zA-Z0-9_]+)(\s*\(\s*[^)]*\s*\))', re.IGNORECASE)
+        
+        # Function to replace matches
+        def replace_func(match):
+            clause = match.group(1)  # FROM or JOIN
+            table_name = match.group(2)  # _cache_table
+            params = match.group(3)  # (params)
+            
+            # Extract the parameter content without parentheses
+            # Improved to handle extra whitespace
+            param_content = re.sub(r'^\s*\(\s*|\s*\)\s*$', '', params).strip()
+            
+            # Convert to proper table syntax: 
+            # "_cache_table(param)" becomes "_cache_table_param"
+            if param_content:
+                # Clean param_content to be part of an identifier
+                clean_param = re.sub(r'[^a-zA-Z0-9_]', '_', param_content)
+                new_table = f'{table_name}_{clean_param}'
+                return f'{clause} {new_table}'
+            else:
+                return f'{clause} {table_name}'
+        
+        # Replace in the SQL
+        modified_sql = pattern.sub(replace_func, sql)
+        
+        # Also check for table names in subqueries
+        subquery_pattern = re.compile(r'(\(\s*SELECT[^)]*?FROM\s+)(_cache_[a-zA-Z0-9_]+)(\s*\(\s*[^)]*\s*\))', re.IGNORECASE | re.DOTALL)
+        modified_sql = subquery_pattern.sub(lambda m: m.group(1) + replace_func(m).split(' ', 1)[1], modified_sql)
+        
+        # Log if any changes were made
+        if modified_sql != original_sql:
+            logger.info("Fixed table references that looked like function calls")
+            logger.debug(f"Original SQL: {original_sql}")
+            logger.debug(f"Fixed SQL: {modified_sql}")
+        
+        return modified_sql
     
     def get_cached_plan(self, sql: str) -> Optional[QueryPlan]:
         """
@@ -258,7 +417,9 @@ class QueryOptimizer:
     def optimize_and_execute(
         self,
         con: duckdb.DuckDBPyConnection,
-        sql: str
+        sql: str,
+        ensure_tables_callback: Optional[Callable[[List[str]], None]] = None,
+        deregister_tables_callback: Optional[Callable[[List[str]], None]] = None
     ) -> Tuple[pa.Table, List[str], Dict[str, Any]]:
         """
         Optimize and execute a SQL query
@@ -266,11 +427,21 @@ class QueryOptimizer:
         Args:
             con: DuckDB connection
             sql: SQL query
+            ensure_tables_callback: Callback to ensure tables are registered
+            deregister_tables_callback: Callback to deregister tables after query execution
             
         Returns:
             Tuple of (result table, optimization hints, execution info)
         """
         start_time = time.time()
+        table_refs = []
+        
+        # First, extract table references and ensure they're registered
+        table_refs = self._extract_table_references(sql)
+        if table_refs and ensure_tables_callback:
+            # Call back to the cache to ensure these tables are registered
+            ensure_tables_callback(table_refs)
+            
         cached_plan = self.get_cached_plan(sql)
         
         if cached_plan:
@@ -300,8 +471,36 @@ class QueryOptimizer:
         
         # Execute the optimized query
         execution_start = time.time()
-        result = con.execute(optimized_sql).arrow()
+        result = None
+        try:
+            result = con.execute(optimized_sql).arrow()
+        except Exception as e:
+            # Check if the error is about missing tables
+            if "Table with name" in str(e) and "does not exist" in str(e) and ensure_tables_callback:
+                logger.warning(f"Table not found error, trying to register tables and retry: {e}")
+                # Extract table references again - the first attempt might have missed some
+                table_refs = self._extract_table_references(optimized_sql)
+                if table_refs:
+                    # Register the tables and retry
+                    ensure_tables_callback(table_refs)
+                    # Try again with the registered tables
+                    result = con.execute(optimized_sql).arrow()
+                else:
+                    # If we can't extract table references, re-raise the original error
+                    raise
+            else:
+                # Not a missing table error or no callback to register tables, re-raise
+                raise
+                
         execution_time = time.time() - execution_start
+        
+        # Deregister tables after query completion if callback provided
+        if deregister_tables_callback and table_refs:
+            try:
+                deregister_tables_callback(table_refs)
+                logger.debug(f"Deregistered {len(table_refs)} tables after query execution")
+            except Exception as e:
+                logger.warning(f"Error deregistering tables: {e}")
         
         # Cache the plan if it's not already cached
         if not cached_plan:
@@ -314,10 +513,95 @@ class QueryOptimizer:
             "total_time": time.time() - start_time,
             "row_count": result.num_rows,
             "from_cache": cached_plan is not None,
-            "plan": plan
+            "plan": plan,
+            "tables_referenced": table_refs
         }
         
         return result, optimization_hints, execution_info
+    
+    def _extract_table_references(self, sql: str) -> List[str]:
+        """
+        Extract table references from a SQL query
+        
+        Args:
+            sql: SQL query
+            
+        Returns:
+            List of table references
+        """
+        # First, fix any table references that might be function calls
+        fixed_sql = self._fix_table_references(sql)
+        
+        # Simple regex-based extraction - handles common patterns
+        # Find tables in FROM clauses - also handle table names with parentheses
+        # This pattern accounts for cases like "_cache_nyc_yellow_taxi_(jan_2023)"
+        # which should be treated as a table name, not a function call
+        
+        # First, search for potential function-like patterns that are actually table references
+        func_table_pattern = re.compile(r'FROM\s+(_cache_)?([a-zA-Z0-9_]+)(\s*\([^)]*\))', re.IGNORECASE)
+        func_matches = func_table_pattern.findall(sql)
+        
+        # Regular table reference pattern
+        from_tables = re.findall(r'FROM\s+(_cache_)?([a-zA-Z0-9_]+)', fixed_sql, re.IGNORECASE)
+        
+        # Find tables in JOIN clauses
+        join_tables = re.findall(r'JOIN\s+(_cache_)?([a-zA-Z0-9_]+)', fixed_sql, re.IGNORECASE)
+        
+        # Also check for function-like tables in JOIN clauses
+        join_func_matches = re.findall(r'JOIN\s+(_cache_)?([a-zA-Z0-9_]+)(\s*\([^)]*\))', sql, re.IGNORECASE)
+        
+        # Process function-like matches to get the full table name with parentheses
+        tables = []
+        for prefix, table, params in func_matches:
+            # Skip common SQL keywords that might be mistaken for tables
+            if table.lower() in ('select', 'where', 'group', 'order', 'having', 'limit', 'offset'):
+                continue
+            
+            # Extract parameter content
+            param_content = re.sub(r'^\s*\(\s*|\s*\)\s*$', '', params).strip()
+            if param_content:
+                # Create both versions of the table name
+                full_table_name = table + params.strip()
+                tables.append(table)
+                
+                # Add the transformed name that will be used in the query
+                clean_param = re.sub(r'[^a-zA-Z0-9_]', '_', param_content)
+                transformed_name = f"{table}_{clean_param}"
+                tables.append(transformed_name)
+            else:
+                tables.append(table)
+                
+        # Process join function-like matches similarly
+        for prefix, table, params in join_func_matches:
+            # Skip common SQL keywords
+            if table.lower() in ('select', 'where', 'group', 'order', 'having', 'limit', 'offset'):
+                continue
+            
+            # Extract parameter content
+            param_content = re.sub(r'^\s*\(\s*|\s*\)\s*$', '', params).strip()
+            if param_content:
+                # Create both versions of the table name
+                full_table_name = table + params.strip()
+                tables.append(table)
+                
+                # Add the transformed name that will be used in the query
+                clean_param = re.sub(r'[^a-zA-Z0-9_]', '_', param_content)
+                transformed_name = f"{table}_{clean_param}"
+                tables.append(transformed_name)
+            else:
+                tables.append(table)
+        
+        # Combine and process regular table references
+        for prefix, table in from_tables + join_tables:
+            # Skip common SQL keywords that might be mistaken for tables
+            if table.lower() in ('select', 'where', 'group', 'order', 'having', 'limit', 'offset'):
+                continue
+            # Add the table name
+            tables.append(table)
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        return [t for t in tables if not (t in seen or seen.add(t))]
     
     def clear_cache(self) -> None:
         """Clear the query plan cache"""

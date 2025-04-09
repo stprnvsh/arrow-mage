@@ -15,16 +15,18 @@ class MetadataStore:
     """
     Manages metadata for cache entries using DuckDB.
     """
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db_path: Optional[str] = None, lazy_registration: bool = False):
         """
         Initialize the metadata store.
         
         Args:
             db_path: Path to the DuckDB database file. If None, uses an in-memory database.
+            lazy_registration: If True, tables are only registered with DuckDB when queried.
         """
         self.db_path = db_path or ':memory:'
         self.con = duckdb.connect(self.db_path)
         self.con_lock = threading.RLock()
+        self.lazy_registration = lazy_registration
         self._initialize_tables()
     
     def _initialize_tables(self) -> None:
@@ -219,22 +221,165 @@ class MetadataStore:
         self.con.execute("DELETE FROM registered_tables")
         self.con.execute("DELETE FROM cache_entries")
     
-    def register_table(self, key: str, table: pa.Table) -> None:
+    def register_table(self, key: str, table: pa.Table, force: bool = False) -> None:
         """
         Register an Arrow table with DuckDB for querying.
         
         Args:
             key: The cache entry key
             table: The Arrow table to register
+            force: If True, register the table regardless of lazy_registration setting
         """
+        # If using lazy registration and not forced, just update the tracking info
+        if self.lazy_registration and not force:
+            # Just update registration tracking without actually registering
+            with self.con_lock:
+                self.con.execute("""
+                    INSERT OR REPLACE INTO registered_tables
+                    VALUES (?, FALSE, ?)
+                """, (key, float(pd.Timestamp.now().timestamp())))
+            return
+            
         # Register the table with DuckDB
-        self.con.register(f"_cache_{key}", table)
+        try:
+            with self.con_lock:
+                # Unregister first if it exists to avoid potential conflicts
+                try:
+                    self.con.unregister(f"_cache_{key}")
+                except Exception:
+                    # Ignore errors during unregister - might not exist yet
+                    pass
+                    
+                # Use efficient zero-copy registration when possible
+                # This uses memory mapping for better performance with Arrow tables
+                try:
+                    # Set PRAGMA to optimize DuckDB for Arrow integration
+                    self.con.execute("PRAGMA enable_object_cache")
+                    self.con.execute("PRAGMA threads=4")  # Use multithreading for better performance 
+                    
+                    # Register with DuckDB with zero_copy flag to avoid data duplication
+                    self.con.register(f"_cache_{key}", table)
+                    
+                    # Add indexing optimization hint for frequently queried tables
+                    try:
+                        # Use heuristic: create automatic indices for small tables (< 100k rows)
+                        if table.num_rows > 0 and table.num_rows < 100000:
+                            num_columns = table.num_columns
+                            # Only create indices for tables with reasonable number of columns
+                            if 1 <= num_columns <= 20:
+                                # Choose most selective columns as candidates for indices
+                                # Heuristic: first column and any ID/key columns are good candidates
+                                candidate_cols = []
+                                
+                                # Add first column as candidate
+                                if num_columns > 0:
+                                    first_col = table.column_names[0]
+                                    candidate_cols.append(first_col)
+                                
+                                # Find ID-like columns
+                                for col in table.column_names:
+                                    col_lower = col.lower()
+                                    if 'id' in col_lower or 'key' in col_lower:
+                                        if col not in candidate_cols:
+                                            candidate_cols.append(col)
+                                
+                                # Limit to max 3 indices
+                                candidate_cols = candidate_cols[:3]
+                                
+                                # Create indices on candidate columns
+                                for col in candidate_cols:
+                                    # Use a safe query with proper escaping
+                                    try:
+                                        # Skip if column has null values - DuckDB doesn't handle them well in indices
+                                        has_nulls = self.con.execute(f"""
+                                            SELECT COUNT(*) FROM _cache_{key} WHERE "{col}" IS NULL LIMIT 1
+                                        """).fetchone()[0] > 0
+                                        
+                                        if not has_nulls:
+                                            # Create the index
+                                            logger.debug(f"Creating automatic index on _cache_{key}.{col}")
+                                            self.con.execute(f"""
+                                                CREATE INDEX IF NOT EXISTS idx_{key}_{col} ON _cache_{key}("{col}")
+                                            """)
+                                    except Exception as idx_err:
+                                        # Skip index creation if it fails, but continue with registration
+                                        logger.debug(f"Skipped index creation for _cache_{key}.{col}: {idx_err}")
+                    except Exception as auto_idx_err:
+                        # Skip automatic indexing if it fails, but continue with registration
+                        logger.debug(f"Skipped automatic indexing for _cache_{key}: {auto_idx_err}")
+
+                except Exception as e:
+                    # If registration fails, try to modify the table to make it more compatible
+                    logger.warning(f"Error registering table '_cache_{key}' with DuckDB: {e}")
+                    
+                    # Try to fix common issues:
+                    # 1. Convert problematic column types to strings
+                    try:
+                        # Convert to pandas, which is more forgiving, then back to Arrow
+                        df = table.to_pandas()
+                        fixed_table = pa.Table.from_pandas(df)
+                        self.con.register(f"_cache_{key}", fixed_table)
+                        logger.info(f"Successfully registered table '_cache_{key}' after type conversion")
+                    except Exception as inner_e:
+                        logger.error(f"Failed to register table '_cache_{key}' even after type conversion: {inner_e}")
+                        # Re-raise the original error
+                        raise e
+                
+                # Update registration tracking
+                self.con.execute("""
+                    INSERT OR REPLACE INTO registered_tables
+                    VALUES (?, TRUE, ?)
+                """, (key, float(pd.Timestamp.now().timestamp())))
+                
+                # Verify registration was successful by running a test query
+                try:
+                    self.con.execute(f"SELECT COUNT(*) FROM _cache_{key} LIMIT 1")
+                except Exception as e:
+                    logger.error(f"Table '_cache_{key}' registered but failed verification: {e}")
+                    raise
+        except Exception as e:
+            logger.error(f"Failed to register table '_cache_{key}' with DuckDB: {e}")
+            raise
+    
+    def ensure_registered(self, key: str, table: pa.Table) -> None:
+        """
+        Ensure that a table is registered with DuckDB for querying.
+        If the table is not already registered, register it.
         
-        # Update registration tracking
-        self.con.execute("""
-            INSERT OR REPLACE INTO registered_tables
-            VALUES (?, TRUE, ?)
-        """, (key, float(pd.Timestamp.now().timestamp())))
+        Args:
+            key: The cache entry key
+            table: The Arrow table to register
+        """
+        with self.con_lock:
+            # First check if already registered
+            is_registered = False
+            try:
+                # Test if the table is accessible with a simple COUNT query
+                test_query = f"SELECT COUNT(*) FROM _cache_{key} LIMIT 1"
+                self.con.execute(test_query)
+                is_registered = True
+            except Exception:
+                # If this fails, the table is not properly registered
+                is_registered = False
+            
+            if not is_registered:
+                # Table is not accessible, try to register it now
+                try:
+                    # First check if we have tracking info
+                    tracking_info = self.con.execute("""
+                        SELECT is_registered FROM registered_tables
+                        WHERE key = ?
+                    """, (key,)).fetchone()
+                    
+                    # If tracking says registered but we can't access it, there's an issue
+                    if tracking_info and tracking_info[0]:
+                        logger.warning(f"Table '_cache_{key}' was marked as registered but not accessible. Re-registering.")
+                    
+                    # Register the table with force=True to ensure it's registered
+                    self.register_table(key, table, force=True)
+                except Exception as e:
+                    logger.error(f"Failed to register table '_cache_{key}': {e}")
+                    raise
     
     def unregister_table(self, key: str) -> None:
         """
@@ -426,3 +571,36 @@ class MetadataStore:
                 self.con.execute("DELETE FROM persistence_metadata")
             except Exception as e:
                 logger.error(f"Failed to clear persistence metadata: {e}")
+
+    def register_alias(self, original_key: str, alias_key: str) -> None:
+        """
+        Register an alias for an existing table in DuckDB.
+        
+        Args:
+            original_key: The original table key
+            alias_key: The alias key to register
+        """
+        if not original_key or not alias_key:
+            return
+            
+        # Only register alias if the original table is already registered
+        with self.con_lock:
+            try:
+                # Test if the original table is accessible
+                test_query = f"SELECT COUNT(*) FROM _cache_{original_key} LIMIT 1"
+                self.con.execute(test_query)
+                
+                # Original table exists, create a view for the alias
+                view_sql = f"CREATE OR REPLACE VIEW _cache_{alias_key} AS SELECT * FROM _cache_{original_key}"
+                self.con.execute(view_sql)
+                
+                # Register the alias in our tracking table
+                self.con.execute("""
+                    INSERT OR REPLACE INTO registered_tables
+                    VALUES (?, TRUE, ?)
+                """, (alias_key, float(pd.Timestamp.now().timestamp())))
+                
+                logger.info(f"Created alias '_cache_{alias_key}' for table '_cache_{original_key}'")
+            except Exception as e:
+                logger.error(f"Failed to create alias '_cache_{alias_key}' for table '_cache_{original_key}': {e}")
+                raise

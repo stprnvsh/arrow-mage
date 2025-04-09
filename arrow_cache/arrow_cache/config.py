@@ -10,11 +10,18 @@ DEFAULT_CONFIG = {
     "memory_limit": None,  # None means use system available memory
     "memory_pool_type": "system",  # Options: system, jemalloc, mimalloc
     "memory_spill_threshold": 0.8,  # Percentage of memory limit that triggers spilling
+    "enable_leak_detection": False,  # Enable memory leak detection (may impact performance)
     
     # Partitioning settings
     "partition_size_rows": 100_000,  # Default number of rows per partition
     "partition_size_bytes": 100 * 1024 * 1024,  # 100MB default partition size
     "auto_partition": True,  # Automatically partition large datasets
+    
+    # Streaming settings for large files
+    "enable_streaming": True,  # Enable streaming for large files
+    "streaming_chunk_size": 50_000,  # Rows per chunk when streaming
+    "parallel_conversion": True,  # Use parallel processing for conversion
+    "max_conversion_memory": 2 * 1024 * 1024 * 1024,  # 2GB max memory for conversion
     
     # Threading settings
     "thread_count": 0,  # 0 means use all available cores
@@ -22,14 +29,15 @@ DEFAULT_CONFIG = {
     
     # Compression settings
     "enable_compression": True,
-    "compression_type": "lz4",  # Options: none, lz4, zstd, snappy
-    "compression_level": 1,  # Compression level (algorithm-specific)
+    "compression_type": "zstd",  # Options: none, lz4, zstd, snappy
+    "compression_level": 3,  # Compression level (algorithm-specific)
     "dictionary_encoding": True,  # Enable dictionary encoding for string columns
     
     # Query optimization
     "cache_query_plans": True,
     "query_plan_cache_size": 100,  # Number of query plans to cache
     "use_statistics": True,  # Use statistics for query optimization
+    "lazy_duckdb_registration": True,  # Only register tables with DuckDB when queried
     
     # Storage settings
     "spill_to_disk": True,
