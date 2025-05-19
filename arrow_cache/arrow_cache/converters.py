@@ -6,6 +6,9 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import logging
+import sys
+import re # Added for regex in geometry info
 
 # Check for optional dependencies
 HAVE_GEOPANDAS = importlib.util.find_spec("geopandas") is not None
@@ -17,18 +20,67 @@ if HAVE_GEOPANDAS:
 if HAVE_PARQUET:
     import pyarrow.parquet as pq
 
+# Get the module's logger
+logger = logging.getLogger(__name__)
 
-def to_arrow_table(data: Any, preserve_index: bool = True) -> pa.Table:
+# Try to detect GeoArrow extension types
+try:
+    # Check if pyarrow has geo support integrated or via extension type check
+    HAS_GEOARROW = hasattr(pa, 'has_geo') and pa.has_geo()
+    # Alternatively, check for specific types if has_geo() isn't present
+    if not HAS_GEOARROW:
+         # Import specific types if available (adjust based on actual geoarrow lib structure)
+         # This is a placeholder, actual import might differ
+         # from pyarrow.compute import geoarrow # Example
+         # HAS_GEOARROW = True 
+         pass # Keep HAS_GEOARROW false if specific types aren't found/checked
+except ImportError:
+    HAS_GEOARROW = False
+logger.info(f"GeoArrow detection: {HAS_GEOARROW}")
+
+def safe_dictionary_encode(column: pa.Array) -> pa.Array:
+    """
+    Safely apply dictionary encoding to a column.
+    
+    Args:
+        column: PyArrow array to encode
+        
+    Returns:
+        Dictionary-encoded array or original array if encoding fails
+    """
+    # Skip if column is already dictionary encoded
+    if pa.types.is_dictionary(column.type):
+        return column
+        
+    # Skip null columns
+    if column.null_count == len(column):
+        return column
+        
+    import pyarrow.compute as pc
+    
+    # Apply dictionary encoding
+    try:
+        return pc.dictionary_encode(column)
+    except:
+        # Return original if encoding fails
+        return column
+
+
+def to_arrow_table(data: Any, preserve_index: bool = True, format: Optional[str] = None) -> pa.Table:
     """
     Convert various data types to an Arrow table.
     
     Args:
         data: The data to convert (DataFrame, GeoDataFrame, file path, etc.)
         preserve_index: Whether to preserve the index as a column
+        format: Optional file format hint when data is a path
         
     Returns:
         Arrow table
     """
+    # Import pandas here to ensure it's available in all code paths
+    import pandas as pd
+    
     metadata = {"source_type": type(data).__name__}
     
     # Case 1: Already an Arrow table
@@ -38,55 +90,19 @@ def to_arrow_table(data: Any, preserve_index: bool = True) -> pa.Table:
     # Case 2: Pandas DataFrame
     if isinstance(data, pd.DataFrame):
         if HAVE_GEOPANDAS and isinstance(data, gpd.GeoDataFrame):
-            table, _ = _convert_geodataframe(data, preserve_index, metadata)
+            table, geo_meta = _convert_geodataframe(data, preserve_index)
+            metadata.update(geo_meta) # Merge geospatial metadata
             return table
         else:
-            # For large dataframes, use a more memory-efficient approach
-            if len(data) > 1000000:  # 1M+ rows
-                return _convert_large_dataframe(data, preserve_index, metadata)
-            else:
-                table, _ = _convert_dataframe(data, preserve_index, metadata)
-                return table
-    
-    # Case 3: Path to a file
-    if isinstance(data, (str, Path)):
-        path = str(data)
-        ext = os.path.splitext(path)[1].lower()
-        metadata["source_path"] = path
-        
-        # For large files, use more efficient loading methods
-        file_size = os.path.getsize(path) if os.path.exists(path) else 0
-        is_large_file = file_size > 1024 * 1024 * 1024  # 1GB+
-        
-        if ext == '.parquet' and HAVE_PARQUET:
-            # For very large parquet files, don't load everything at once
-            if is_large_file:
-                return _load_large_parquet(path, metadata)
-            else:
-                table, _ = _load_parquet(path, metadata)
-                return table
-        elif ext == '.feather' or ext == '.arrow':
-            table, _ = _load_feather(path, metadata)
+            table, _ = _convert_dataframe(data, preserve_index, metadata)
             return table
-        elif ext == '.csv':
-            # For large CSV files, use chunked reader
-            if is_large_file:
-                return _load_large_csv(path, metadata)
-            else:
-                table, _ = _load_csv(path, metadata)
-                return table
-        elif ext in ['.geojson', '.shp', '.gpkg'] and HAVE_GEOPANDAS:
-            table, _ = _load_geofile(path, metadata)
-            return table
-        else:
-            raise ValueError(f"Unsupported file extension: {ext}")
     
-    # Case 4: Convert NumPy array to Arrow array
+    # Case 3: NumPy array to Arrow array
     if isinstance(data, np.ndarray):
         table, _ = _convert_numpy(data, metadata)
         return table
     
-    # Case 5: Convert dict of arrays or list of dicts
+    # Case 4: Convert dict of arrays or list of dicts
     if isinstance(data, dict) and all(isinstance(v, (list, np.ndarray)) for v in data.values()):
         return pa.Table.from_pydict(data)
     
@@ -94,6 +110,120 @@ def to_arrow_table(data: Any, preserve_index: bool = True) -> pa.Table:
         table, _ = _convert_list_of_dicts(data, metadata)
         return table
     
+    # Case 5: Handle BytesIO or StringIO objects (in-memory buffers)
+    if isinstance(data, io.BytesIO) or isinstance(data, io.StringIO):
+        if not format:
+            raise ValueError("Format must be specified when using in-memory buffers")
+        
+        # Reset the buffer position to the beginning
+        data.seek(0)
+        
+        if format == 'parquet':
+            if not HAVE_PARQUET:
+                raise ImportError("pyarrow.parquet is required for reading Parquet files")
+            import pyarrow.parquet as pq
+            return pq.read_table(data)
+        
+        elif format == 'feather' or format == 'arrow':
+            reader = pa.ipc.open_file(data)
+            return reader.read_all()
+        
+        elif format == 'csv':
+            import pyarrow.csv as csv
+            read_options = csv.ReadOptions(use_threads=True)
+            parse_options = csv.ParseOptions(delimiter=',')
+            convert_options = csv.ConvertOptions(strings_can_be_null=True)
+            return csv.read_csv(data, read_options=read_options, 
+                             parse_options=parse_options,
+                             convert_options=convert_options)
+        
+        elif format == 'json':
+            # For JSON, use pandas as a bridge
+            # Determine if we have text or binary data
+            if isinstance(data, io.BytesIO):
+                # Convert binary to string
+                content = data.getvalue().decode('utf-8')
+                json_data = io.StringIO(content)
+            else:
+                json_data = data
+            
+            # Use pandas to parse JSON
+            df = pd.read_json(json_data)
+            return pa.Table.from_pandas(df, preserve_index=preserve_index)
+        
+        else:
+            raise ValueError(f"Unsupported in-memory format: {format}")
+    
+    # Case 6: Path to a file
+    if isinstance(data, (str, Path)):
+        path = str(data)
+        metadata["source_path"] = path
+        
+        # Use format parameter if provided, otherwise infer from extension
+        ext = os.path.splitext(path)[1].lower()
+        file_format = format or ext[1:] if ext else None
+        
+        if file_format == 'parquet' or ext == '.parquet' or ext == '.pq':
+            if not HAVE_PARQUET:
+                raise ImportError("pyarrow.parquet is required for reading Parquet files")
+            table, _ = _load_parquet(path, metadata)
+            return table
+        elif file_format == 'geoparquet' or ext == '.geoparquet':
+            if not HAVE_PARQUET or not HAVE_GEOPANDAS:
+                raise ImportError("pyarrow.parquet and geopandas are required for reading GeoParquet files")
+            # For GeoParquet, we use GeoPandas since it knows how to handle the geo metadata
+            if HAVE_GEOPANDAS:
+                import geopandas as gpd
+                gdf = gpd.read_parquet(path)
+                # Extract geospatial metadata
+                geo_metadata = {
+                    "geometry_column": gdf.geometry.name,
+                    "crs_info": gdf.crs.to_string() if gdf.crs else None,
+                    "geometry_type": gdf.geom_type.mode()[0] if not gdf.geom_type.empty else None,
+                    "storage_format": "WKB",
+                    "source_format": "geoparquet"
+                }
+                metadata.update(geo_metadata)
+                return pa.Table.from_pandas(gdf)
+            else:
+                # Fallback to regular parquet if geopandas is not available
+                logger.warning("GeoPandas not available, reading GeoParquet file as regular Parquet")
+                table, _ = _load_parquet(path, metadata)
+                return table
+        elif file_format == 'feather' or file_format == 'arrow' or ext == '.feather' or ext == '.arrow':
+            table, _ = _load_feather(path, metadata)
+            return table
+        elif file_format == 'csv' or ext == '.csv':
+            table, _ = _load_csv(path, metadata)
+            return table
+        elif file_format == 'json' or ext == '.json':
+            # Handle JSON files directly without temporary files
+            with open(path, 'r', encoding='utf-8') as f:
+                df = pd.read_json(f)
+            return pa.Table.from_pandas(df, preserve_index=preserve_index)
+        elif (file_format == 'geojson' or ext == '.geojson' or 
+              file_format == 'shp' or ext == '.shp' or 
+              file_format == 'gpkg' or ext == '.gpkg') and HAVE_GEOPANDAS:
+            table, geo_meta = _load_geofile(path)
+            metadata.update(geo_meta) # Merge geospatial metadata
+            metadata["source_path"] = path # Ensure path is added
+            return table
+        else:
+            # Raise a specific error if the format derived from path/param is unsupported
+            available_formats = [
+                'parquet', 'feather', 'arrow', 'csv', 'json',
+                'geojson' if HAVE_GEOPANDAS else None,
+                'shp' if HAVE_GEOPANDAS else None,
+                'gpkg' if HAVE_GEOPANDAS else None
+            ]
+            available_formats = [f for f in available_formats if f]  # Filter out None values
+            error_format = file_format or ext or "(unknown)"
+            raise ValueError(
+                f"Unsupported file format '{error_format}' for path '{path}'. "
+                f"Ensure the format is one of {available_formats} and required dependencies are installed."
+            )
+
+    # This error is now only raised if the initial data type is not Table, DataFrame, ndarray, dict, list, or path string
     raise ValueError(f"Unsupported data type: {type(data).__name__}")
 
 
@@ -116,11 +246,7 @@ def from_arrow_table(table: pa.Table, target_type: str, metadata: Optional[Dict[
     
     if target_type == 'pandas' or target_type == 'pd.DataFrame':
         # Use efficient conversion to pandas
-        return table.to_pandas(
-            split_blocks=True,  # Split result blocks by column for better memory usage
-            self_destruct=True,  # Allow Arrow to reuse memory from the Table
-            date_as_object=False,  # Keep dates as native types
-        )
+        return table.to_pandas()
     
     if target_type == 'geopandas' or target_type == 'gpd.GeoDataFrame':
         if not HAVE_GEOPANDAS:
@@ -128,28 +254,16 @@ def from_arrow_table(table: pa.Table, target_type: str, metadata: Optional[Dict[
         return _arrow_to_geodataframe(table, metadata)
     
     if target_type == 'dict':
-        # Convert directly to dict without going through pandas
-        return {col: table[col].to_numpy() for col in table.column_names}
+        # Convert directly to dict using pyarrow
+        return table.to_pydict()
     
     if target_type == 'numpy':
-        # Try to convert directly to numpy when possible
-        # For simple tables with homogeneous types
-        if table.num_columns == 1:
-            # Single column table can be converted directly
-            return table.column(0).to_numpy()
-        else:
-            # For multiple columns, try to use Arrow's RecordBatch for efficient conversion
-            batch = table.to_batches()[0] if table.num_rows > 0 else None
-            if batch:
-                try:
-                    # Try direct conversion if all columns have compatible types
-                    return batch.to_numpy()
-                except:
-                    # Fall back to pandas conversion if direct conversion fails
-                    return table.to_pandas().to_numpy()
-            else:
-                # Empty table
-                return np.array([])
+        # Use Arrow's RecordBatch for efficient conversion to numpy
+        if table.num_rows == 0:
+            return np.array([])
+        
+        # Convert to structured numpy array
+        return table.to_pandas().to_numpy()
     
     if target_type == 'parquet' and HAVE_PARQUET:
         # Return as in-memory parquet bytes
@@ -179,40 +293,34 @@ def estimate_size_bytes(table: pa.Table) -> int:
     Returns:
         Estimated size in bytes
     """
-    # Use a set to track unique buffer addresses to avoid double-counting
-    # shared memory in sliced tables
-    unique_buffers = set()
-    size = 0
+    # Use Arrow's memory pool to get an accurate measurement
+    import gc
     
-    for column in table.columns:
-        # Handle ChunkedArray by iterating through its chunks
-        if isinstance(column, pa.ChunkedArray):
-            for chunk in column.chunks:
-                # Check if the chunk is a slice/view of another array
-                is_slice = hasattr(chunk, '_is_slice') and chunk._is_slice
-                
-                for buf in chunk.buffers():
-                    if buf is not None:
-                        # Use buffer address as a unique identifier
-                        buffer_id = id(buf)
-                        if buffer_id not in unique_buffers:
-                            unique_buffers.add(buffer_id)
-                            size += buf.size
-        else:
-            # Handle Array directly
-            # Check if the array is a slice/view
-            is_slice = hasattr(column, '_is_slice') and column._is_slice
-            
-            for buf in column.buffers():
-                if buf is not None:
-                    # Use buffer address as a unique identifier
-                    buffer_id = id(buf)
-                    if buffer_id not in unique_buffers:
-                        unique_buffers.add(buffer_id)
-                        size += buf.size
+    # Force a GC cycle first to clean up any lingering objects
+    gc.collect()
+    
+    # Get the default memory pool
+    memory_pool = pa.default_memory_pool()
+    
+    # Capture memory before accessing the table
+    memory_before = memory_pool.bytes_allocated()
+    
+    # Access the data to ensure it's materialized
+    for col in table.columns:
+        # Just access one buffer per chunk to force materialization
+        for chunk in col.chunks:
+            if len(chunk) > 0:
+                chunk[0]  # Access first element to materialize
+                break
+    
+    # Measure memory after access
+    memory_after = memory_pool.bytes_allocated()
+    
+    # Calculate the difference
+    table_size = memory_after - memory_before
     
     # Add schema overhead
-    schema_size = len(table.schema.to_string()) * 2  # Rough estimate for schema
+    schema_size = len(table.schema.to_string()) * 2
     
     # Add metadata size if present
     metadata_size = 0
@@ -220,27 +328,16 @@ def estimate_size_bytes(table: pa.Table) -> int:
         for k, v in table.schema.metadata.items():
             metadata_size += len(k) + len(v)
     
-    # Add buffer management overhead (conservative estimate)
-    overhead = table.num_columns * 16  # Reduced from 24 to 16 bytes per column pointer
-    
-    # Safety check to prevent unrealistically large values
-    # This helps catch potential miscalculations
-    total_size = size + schema_size + metadata_size + overhead
-    if total_size > 100 * 1024 * 1024 * 1024:  # > 100GB
-        # Sanity check against system memory
-        import psutil
-        system_memory = psutil.virtual_memory().total
-        if total_size > system_memory * 2:
-            # This is clearly an error - cap at a reasonable percentage of system memory
-            return int(system_memory * 0.8)
-    
-    return total_size
+    return table_size + schema_size + metadata_size
 
 
 # Private helper functions for conversion
 
 def _convert_dataframe(df: pd.DataFrame, preserve_index: bool, metadata: Dict[str, Any]) -> Tuple[pa.Table, Dict[str, Any]]:
     """Convert a pandas DataFrame to an Arrow table."""
+    # Import pandas to ensure it's available in this scope
+    import pandas as pd
+    
     metadata["pandas_version"] = pd.__version__
     metadata["columns"] = list(df.columns)
     
@@ -270,11 +367,28 @@ def _convert_geodataframe(gdf: 'gpd.GeoDataFrame', preserve_index: bool, metadat
     result = gdf.copy()
     result[gdf._geometry_column_name] = wkb_series
     
-    return pa.Table.from_pandas(result), metadata
+    # Convert GeoDataFrame to Arrow, store geometry as WKB
+    # Extract geospatial metadata
+    geo_metadata = {
+        "geometry_column": gdf.geometry.name,
+        "crs_info": gdf.crs.to_string() if gdf.crs else None,
+        "geometry_type": gdf.geom_type.mode()[0] if not gdf.geom_type.empty else None, # Dominant type
+        "storage_format": "WKB" # Assume WKB for Arrow storage
+    }
+    
+    # Convert GeoDataFrame to Arrow Table, handling geometry
+    table = pa.Table.from_pandas(result, preserve_index=preserve_index)
+    
+    # Potentially update metadata with source type info
+    metadata["source_type"] = "GeoDataFrame"
+    
+    return table, geo_metadata
 
 
 def _arrow_to_geodataframe(table: pa.Table, metadata: Dict[str, Any]) -> 'gpd.GeoDataFrame':
     """Convert an Arrow table back to a GeoPandas GeoDataFrame."""
+    # Import pandas and geopandas to ensure they're available in this scope
+    import pandas as pd
     import geopandas as gpd
     from shapely import wkb
     
@@ -382,13 +496,11 @@ def _load_csv(path: str, metadata: Dict[str, Any]) -> Tuple[pa.Table, Dict[str, 
     import pyarrow.csv as csv
     
     # Configure CSV reading options for best performance
-    read_options = csv.ReadOptions(use_threads=True, block_size=4*1024*1024)  # 4MB blocks
+    read_options = csv.ReadOptions(use_threads=True, block_size=8*1024*1024)  # 8MB blocks
     parse_options = csv.ParseOptions(delimiter=',')
     convert_options = csv.ConvertOptions(
         strings_can_be_null=True,
-        auto_dict_encode=True,  # Use dictionary encoding for strings
-        include_columns=None,
-        include_missing_columns=False
+        auto_dict_encode=True  # Use dictionary encoding for strings
     )
     
     # Read directly to Arrow table
@@ -407,274 +519,33 @@ def _load_csv(path: str, metadata: Dict[str, Any]) -> Tuple[pa.Table, Dict[str, 
     return table, metadata
 
 
-def _load_geofile(path: str, metadata: Dict[str, Any]) -> Tuple[pa.Table, Dict[str, Any]]:
-    """Load a geographic file as an Arrow table."""
-    import geopandas as gpd
+def _load_geofile(path: str) -> Tuple[pa.Table, Dict[str, Any]]:
+    """
+    Load a geospatial file using GeoPandas and return an Arrow Table and metadata.
     
-    ext = os.path.splitext(path)[1].lower()
-    metadata["file_format"] = ext.lstrip('.')
+    Args:
+        path: Path to the geospatial file
+        
+    Returns:
+        Tuple of (Arrow table, geospatial metadata dictionary)
+    """
+    if not HAVE_GEOPANDAS:
+        raise ImportError("GeoPandas is required for reading geospatial files.")
     
     gdf = gpd.read_file(path)
-    return _convert_geodataframe(gdf, True, metadata)
-
-
-def _convert_large_dataframe(df: pd.DataFrame, preserve_index: bool, metadata: Dict[str, Any]) -> pa.Table:
-    """
-    Convert a large pandas DataFrame to an Arrow table with lower memory usage.
     
-    Args:
-        df: DataFrame to convert
-        preserve_index: Whether to preserve the index
-        metadata: Conversion metadata
-        
-    Returns:
-        Arrow table
-    """
-    import gc
+    # Extract geospatial metadata
+    geo_metadata = {
+        "geometry_column": gdf.geometry.name,
+        "crs_info": gdf.crs.to_string() if gdf.crs else None,
+        "geometry_type": gdf.geom_type.mode()[0] if not gdf.geom_type.empty else None, # Dominant type
+        "storage_format": "WKB" # Assume WKB for Arrow storage
+    }
     
-    metadata["pandas_version"] = pd.__version__
-    metadata["columns"] = list(df.columns)
+    # Convert to Arrow Table
+    table = pa.Table.from_pandas(gdf)
     
-    # Handle the index directly with Arrow
-    if preserve_index and not df.index.equals(pd.RangeIndex(len(df))):
-        # Create index array directly instead of using reset_index
-        index_array = pa.array(df.index.values)
-        index_name = df.index.name or 'index'
-        metadata["had_index"] = True
-        
-        # Create arrays for existing columns
-        arrays = [index_array]
-        field_names = [index_name]
-    else:
-        arrays = []
-        field_names = []
-    
-    # Process columns in batches to reduce memory usage
-    # Process columns in batches of 20 to reduce peak memory usage
-    column_batches = [list(df.columns)[i:i+20] for i in range(0, len(df.columns), 20)]
-    
-    for batch in column_batches:
-        # Process each column batch
-        batch_arrays = []
-        
-        for col in batch:
-            # Convert column to Arrow array
-            try:
-                # Try to optimize numeric columns
-                if pd.api.types.is_numeric_dtype(df[col]):
-                    # For numeric columns, convert directly to numpy then Arrow
-                    arr = pa.array(df[col].values, type=None)
-                else:
-                    # For other types, use direct Arrow conversion
-                    # Avoid going through Python objects when possible
-                    if pd.api.types.is_string_dtype(df[col]):
-                        arr = pa.array(df[col].values, type=pa.string())
-                    elif pd.api.types.is_bool_dtype(df[col]):
-                        arr = pa.array(df[col].values, type=pa.bool_())
-                    elif pd.api.types.is_datetime64_dtype(df[col]):
-                        arr = pa.array(df[col].values, type=pa.timestamp('ns'))
-                    else:
-                        arr = pa.array(df[col])
-                
-                batch_arrays.append(arr)
-                field_names.append(col)
-            except Exception as e:
-                # If conversion fails, try a more robust approach
-                try:
-                    # Try to convert through numpy when possible
-                    arr = pa.array(df[col].values)
-                except:
-                    # Last resort - use Python objects
-                    arr = pa.array(df[col].tolist())
-                batch_arrays.append(arr)
-                field_names.append(col)
-        
-        arrays.extend(batch_arrays)
-        
-        # Explicitly clean up batch references
-        del batch_arrays
-        gc.collect()
-    
-    # Create the table from arrays
-    table = pa.Table.from_arrays(arrays, names=field_names)
-    
-    # Clean up references to large objects
-    del arrays
-    gc.collect()
-    
-    return table
-
-
-def _load_large_parquet(path: str, metadata: Dict[str, Any]) -> pa.Table:
-    """
-    Load a large parquet file efficiently.
-    
-    Args:
-        path: Path to the parquet file
-        metadata: Conversion metadata
-        
-    Returns:
-        Arrow table
-    """
-    import pyarrow.parquet as pq
-    import pyarrow as pa
-    import os
-    import gc
-    
-    metadata["file_format"] = "parquet"
-    
-    # Read metadata without loading the whole file
-    parquet_metadata = pq.read_metadata(path)
-    metadata["num_row_groups"] = parquet_metadata.num_row_groups
-    metadata["num_rows"] = parquet_metadata.num_rows
-    metadata["created_by"] = parquet_metadata.created_by
-    
-    # Load the schema
-    schema = pq.read_schema(path)
-    
-    # Get system info for better parallelism
-    import psutil
-    cpu_count = os.cpu_count() or 4
-    available_memory = psutil.virtual_memory().available
-    
-    # For extremely large files, use row group-level reading
-    if parquet_metadata.num_rows > 100000000 or os.path.getsize(path) > 4 * 1024 * 1024 * 1024:  # 100M+ rows or 4GB+
-        # Calculate optimal number of row groups to read at once based on file size and available memory
-        file_size = os.path.getsize(path)
-        
-        # Target using at most 25% of available memory at once
-        target_memory = min(available_memory * 0.25, 2 * 1024 * 1024 * 1024)  # Max 2GB chunks
-        
-        # Estimate row groups per batch
-        avg_row_group_size = file_size / parquet_metadata.num_row_groups
-        row_groups_per_batch = max(1, int(target_memory / avg_row_group_size))
-        
-        # Read in parallel by processing multiple batches of row groups simultaneously
-        from concurrent.futures import ThreadPoolExecutor
-        
-        # Function to read a batch of row groups
-        def read_row_group_batch(batch_indices):
-            return pq.read_table(
-                path, 
-                use_threads=True,
-                memory_map=True,  # Use memory mapping for better performance
-                row_groups=batch_indices
-            )
-        
-        # Create batches of row group indices
-        batches = []
-        for i in range(0, parquet_metadata.num_row_groups, row_groups_per_batch):
-            end_idx = min(i + row_groups_per_batch, parquet_metadata.num_row_groups)
-            batches.append(list(range(i, end_idx)))
-        
-        # Use thread pool to read batches in parallel, but limit threads to avoid oversubscription
-        tables = []
-        max_threads = min(len(batches), max(2, cpu_count - 1))
-        with ThreadPoolExecutor(max_workers=max_threads) as executor:
-            for batch_table in executor.map(read_row_group_batch, batches):
-                tables.append(batch_table)
-                # Force garbage collection after each batch to prevent memory buildup
-                gc.collect()
-        
-        # Concatenate the tables
-        result = pa.concat_tables(tables)
-        
-        # Force garbage collection again
-        del tables
-        gc.collect()
-        
-        return result
-    
-    # For moderately large files, use memory mapping and parallel reading
-    try:
-        # Use the maximum number of threads (leave one for system)
-        max_threads = max(2, cpu_count - 1)
-        table = pq.read_table(
-            path, 
-            use_threads=True,
-            memory_map=True,  # Use memory mapping for better performance
-            use_pandas_metadata=False  # Skip pandas metadata for faster loading
-        )
-        return table
-    except pa.lib.ArrowMemoryError:
-        # If we run out of memory, fall back to row group reading
-        tables = []
-        for i in range(parquet_metadata.num_row_groups):
-            # Read one row group at a time
-            batch = pq.read_table(path, row_groups=[i], use_threads=True)
-            tables.append(batch)
-            
-            # Force garbage collection after each batch
-            if i % 10 == 0:
-                gc.collect()
-        
-        # Concatenate the tables
-        result = pa.concat_tables(tables)
-        
-        # Force garbage collection
-        del tables
-        gc.collect()
-        
-        return result
-
-
-def _load_large_csv(path: str, metadata: Dict[str, Any]) -> pa.Table:
-    """
-    Load a large CSV file efficiently.
-    
-    Args:
-        path: Path to the CSV file
-        metadata: Conversion metadata
-        
-    Returns:
-        Arrow table
-    """
-    import pyarrow.csv as csv
-    
-    metadata["file_format"] = "csv"
-    
-    # For large CSV files, read a sample to get the schema
-    read_options = csv.ReadOptions(block_size=1024*1024)  # 1MB blocks
-    parse_options = csv.ParseOptions(delimiter=',')
-    convert_options = csv.ConvertOptions(
-        strings_can_be_null=True,
-        include_columns=None,
-        include_missing_columns=False,
-        auto_dict_encode=True  # Use dictionary encoding for strings
-    )
-    
-    # Read the schema and a small sample
-    with open(path, 'rb') as f:
-        # Read a small sample to infer schema
-        sample_table = csv.read_csv(
-            f, 
-            read_options=read_options,
-            parse_options=parse_options,
-            convert_options=convert_options
-        )
-    
-    # For extremely large files, return just the schema
-    file_size = os.path.getsize(path)
-    if file_size > 5 * 1024 * 1024 * 1024:  # 5GB+
-        # Create an empty table with the schema
-        empty_arrays = []
-        for field in sample_table.schema:
-            empty_arrays.append(pa.array([], type=field.type))
-        
-        # We return an empty table with correct schema
-        # This is a placeholder - actual data will be loaded via streaming
-        return pa.Table.from_arrays(empty_arrays, schema=sample_table.schema)
-    
-    # For moderately large files, use better options
-    read_options = csv.ReadOptions(use_threads=True, block_size=8*1024*1024)  # 8MB blocks
-    
-    # Read the full file
-    return csv.read_csv(
-        path, 
-        read_options=read_options,
-        parse_options=parse_options,
-        convert_options=convert_options
-    )
+    return table, geo_metadata
 
 
 def guess_format(file_path: str) -> Optional[str]:
@@ -716,3 +587,147 @@ def guess_format(file_path: str) -> Optional[str]:
     
     # Unknown extension
     return None
+
+def _map_arrow_type_to_duckdb(arrow_type: pa.DataType) -> str:
+    """Maps PyArrow DataType to DuckDB SQL type string."""
+    if pa.types.is_boolean(arrow_type):
+        return "BOOLEAN"
+    elif pa.types.is_int8(arrow_type):
+        return "TINYINT"
+    elif pa.types.is_int16(arrow_type):
+        return "SMALLINT"
+    elif pa.types.is_int32(arrow_type):
+        return "INTEGER"
+    elif pa.types.is_int64(arrow_type):
+        return "BIGINT"
+    elif pa.types.is_uint8(arrow_type):
+        return "UTINYINT"
+    elif pa.types.is_uint16(arrow_type):
+        return "USMALLINT"
+    elif pa.types.is_uint32(arrow_type):
+        return "UINTEGER"
+    elif pa.types.is_uint64(arrow_type):
+        return "UBIGINT"
+    elif pa.types.is_float16(arrow_type):
+        return "FLOAT" # DuckDB might map half-float to FLOAT
+    elif pa.types.is_float32(arrow_type):
+        return "FLOAT"
+    elif pa.types.is_float64(arrow_type):
+        return "DOUBLE"
+    elif pa.types.is_decimal(arrow_type):
+        # DuckDB DECIMAL(width, scale)
+        return f"DECIMAL({arrow_type.precision}, {arrow_type.scale})"
+    elif pa.types.is_date32(arrow_type) or pa.types.is_date64(arrow_type):
+        return "DATE"
+    elif pa.types.is_time32(arrow_type) or pa.types.is_time64(arrow_type):
+        return "TIME"
+    elif pa.types.is_timestamp(arrow_type):
+        # DuckDB TIMESTAMP supports nanoseconds if compiled with it
+        # Otherwise defaults to microseconds. Let DuckDB handle precision.
+        return "TIMESTAMP"
+    elif pa.types.is_duration(arrow_type):
+        return "INTERVAL"
+    elif pa.types.is_binary(arrow_type) or pa.types.is_large_binary(arrow_type):
+        return "BLOB"
+    elif pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
+        return "VARCHAR"
+    elif pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type):
+        # Map Arrow list to DuckDB list
+        value_type = _map_arrow_type_to_duckdb(arrow_type.value_type)
+        return f"{value_type}[]"
+    elif pa.types.is_struct(arrow_type):
+        # Map Arrow struct to DuckDB struct
+        fields = [f"{field.name} { _map_arrow_type_to_duckdb(field.type)}" for field in arrow_type]
+        return f"STRUCT({', '.join(fields)})"
+    elif pa.types.is_map(arrow_type):
+         key_type = _map_arrow_type_to_duckdb(arrow_type.key_type)
+         item_type = _map_arrow_type_to_duckdb(arrow_type.item_type)
+         return f"MAP({key_type}, {item_type})"
+    elif pa.types.is_dictionary(arrow_type):
+        # Map dictionary to its index type in DuckDB
+        return _map_arrow_type_to_duckdb(arrow_type.index_type)
+    elif pa.types.is_null(arrow_type):
+        return "NULL" # Or handle appropriately
+    else:
+        # Fallback for unknown types
+        logger.warning(f"Unknown Arrow type '{arrow_type}'. Mapping to VARCHAR.")
+        return "VARCHAR"
+
+def _get_geometry_info(table: pa.Table) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Inspects an Arrow Table's schema to identify the geometry column and its format.
+
+    Checks for common names ('geometry', 'geom', 'wkb') and binary type for WKB.
+    If GeoArrow is available, checks for specific GeoArrow extension types.
+
+    Returns:
+        Tuple of (geometry_column_name, storage_format)
+        storage_format can be 'WKB', 'GeoArrow', or None.
+    """
+    potential_geom_cols = {} # Store potential candidates: {col_name: format}
+
+    # Common geometry column names (case-insensitive)
+    common_names = ['geometry', 'geom', 'shape', 'wkb', 'wkt']
+    name_pattern = re.compile(f"^({'|'.join(common_names)})$", re.IGNORECASE)
+
+    for field in table.schema:
+        col_name = field.name
+        col_type = field.type
+
+        # 1. Check using GeoArrow Extension Types (if available)
+        if HAS_GEOARROW:
+            # This requires knowing the specific GeoArrow type names or how to check them
+            # Example placeholder check:
+            # if isinstance(col_type, pa.ExtensionType) and 'geoarrow' in col_type.extension_name:
+            #    storage_format = "GeoArrow" # Could refine based on specific type (point, wkb, etc.)
+            #    potential_geom_cols[col_name] = storage_format
+            #    continue # Found via GeoArrow type, move to next field
+            pass # Add actual GeoArrow type checks here if library/spec known
+
+        # 2. Check by Name and Type (fallback or primary if no GeoArrow)
+        if name_pattern.match(col_name):
+            if pa.types.is_binary(col_type) or pa.types.is_large_binary(col_type):
+                # Strong indicator of WKB if name matches and type is binary
+                potential_geom_cols[col_name] = 'WKB'
+            elif pa.types.is_string(col_type) or pa.types.is_large_string(col_type):
+                 # Could be WKT, but we'll prioritize binary WKB if found
+                 if col_name not in potential_geom_cols: # Don't overwrite WKB detection
+                      potential_geom_cols[col_name] = 'WKT' # Less common for storage, but possible
+
+    # Prioritize detection results
+    if not potential_geom_cols:
+        return None, None # No likely geometry column found
+
+    # Priority: 'geometry' name with WKB/GeoArrow, then other names
+    if 'geometry' in potential_geom_cols and potential_geom_cols['geometry'] in ('WKB', 'GeoArrow'):
+        return 'geometry', potential_geom_cols['geometry']
+
+    # Check other common names with WKB/GeoArrow format
+    for name in common_names:
+        if name in potential_geom_cols and potential_geom_cols[name] in ('WKB', 'GeoArrow'):
+            return name, potential_geom_cols[name]
+
+    # Fallback: return the first detected potential column (could be WKT)
+    first_col = next(iter(potential_geom_cols))
+    return first_col, potential_geom_cols[first_col]
+
+
+def estimate_size_bytes(data: Any) -> int:
+    # ... existing code ...
+    # Fallback: Pandas memory usage
+    if isinstance(data, pd.DataFrame):
+        try:
+            # Deep estimate for object types
+            return data.memory_usage(deep=True).sum()
+        except Exception:
+            # Simple estimate if deep fails
+            return data.memory_usage().sum()
+    # Fallback: GeoPandas memory usage
+    elif HAVE_GEOPANDAS and isinstance(data, gpd.GeoDataFrame):
+         try:
+             return data.memory_usage(deep=True).sum()
+         except Exception:
+             return data.memory_usage().sum()
+
+    # Last resort: Basic Python object size
+    return sys.getsizeof(data)

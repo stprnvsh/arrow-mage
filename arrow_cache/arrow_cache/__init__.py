@@ -23,6 +23,8 @@ from .threading import (
     apply_arrow_compute_parallel
 )
 from .query_optimization import QueryOptimizer, optimize_duckdb_connection, explain_query
+from .utils import clear_arrow_cache
+from .duckdb_ingest import import_from_duckdb, import_to_cache
 
 __all__ = [
     # Main cache class
@@ -64,4 +66,11 @@ __all__ = [
     "QueryOptimizer",
     "optimize_duckdb_connection",
     "explain_query",
+    
+    # DuckDB data ingestion
+    "import_from_duckdb",
+    "import_to_cache",
+    
+    # Utilities
+    "clear_arrow_cache",
 ]

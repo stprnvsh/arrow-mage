@@ -1,17 +1,39 @@
 [project]
 name = "arrow-cache-mcp"
-version = "0.1"
-description = "DataScience MCP"
+version = "0.1.1"
+description = "DataScience MCP with Apache Arrow-based cache for efficient data handling"
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = [ "mcp>=1.6.0", ]
+requires-python = ">=3.9"
+dependencies = [
+    "pandas>=1.5.0",
+    "pyarrow>=11.0.0",
+    "matplotlib>=3.5.0",
+    "psutil>=5.9.0",
+    "numpy>=1.22.0",
+    "duckdb>=0.8.0",
+    "anthropic>=0.4.0",
+    "tabulate>=0.9.0",   # For DataFrame.to_markdown
+    "arrow_cache>=0.2.0",
+]
 [[project.authors]]
-name = "stprnvsh"
-email = "141918471+stprnvsh@users.noreply.github.com"
+name = "Pranav Satessh"
+email = "pranav.sateesh@usi.ch"
 
 [build-system]
-requires = [ "hatchling",]
+requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project.scripts]
-arrow-cache-mcp = "arrow_cache_mcp:main"
+arrow-cache-mcp = "arrow_cache_mcp.server:main"
+
+[project.optional-dependencies]
+geospatial = [
+    "geopandas>=0.12.0",
+    "shapely>=2.0.0",
+]
+viz = [
+    "plotly>=5.10.0",
+]
+
+[tool.hatch.build]
+packages = ["src/arrow_cache_mcp"]

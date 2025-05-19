@@ -1,0 +1,13 @@
+{
+  "fused:mcp": {
+    "description": "Fetches stories from Hacker News based on the specified story type",
+    "parameters": [
+      {
+        "name": "story_type",
+        "type": "string",
+        "description": "Type of stories to fetch (top, new, best, ask, show, job)",
+        "required": false
+      }
+    ]
+  }
+}

@@ -5,14 +5,17 @@ arrow_cache/cache.py
 arrow_cache/cache_entry.py
 arrow_cache/config.py
 arrow_cache/converters.py
+arrow_cache/duckdb_ingest.py
 arrow_cache/eviction_policy.py
 arrow_cache/memory.py
 arrow_cache/metadata_store.py
 arrow_cache/partitioning.py
 arrow_cache/query_optimization.py
 arrow_cache/threading.py
+arrow_cache/utils.py
 arrow_cache.egg-info/PKG-INFO
 arrow_cache.egg-info/SOURCES.txt
 arrow_cache.egg-info/dependency_links.txt
+arrow_cache.egg-info/entry_points.txt
 arrow_cache.egg-info/requires.txt
 arrow_cache.egg-info/top_level.txt

@@ -13,6 +13,10 @@ import concurrent.futures
 from typing import Dict, List, Set, Optional, Any, Callable, Tuple, Union, TypeVar, Generic
 import traceback
 import pyarrow as pa
+import tempfile
+import urllib.request
+from urllib.parse import urlparse
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -466,6 +470,178 @@ class BackgroundProcessingQueue:
             return False
 
 
+def safe_to_arrow_table(data: Any, **kwargs) -> pa.Table:
+    """
+    Safely converts various data types to an Arrow Table using PyArrow directly.
+
+    Args:
+        data: Input data (URL string, file path, pandas DataFrame, etc.)
+        **kwargs: Additional arguments for converters (e.g., preserve_index)
+
+    Returns:
+        pyarrow.Table: The converted Arrow Table.
+
+    Raises:
+        ValueError: If the data format is unsupported or conversion fails.
+    """
+    format_param = kwargs.pop('format', None)
+    preserve_index = kwargs.pop('preserve_index', True)
+    
+    try:
+        # Import dependencies needed for processing
+        import pandas as pd
+        import io
+        import tempfile
+        import os
+        
+        # Import the converter once
+        from arrow_cache.converters import to_arrow_table
+        
+        # Handle URL case
+        if isinstance(data, str) and (data.startswith('http://') or data.startswith('https://')):
+            url = data
+            logger.info(f"Input is URL: {url}")
+            
+            # Determine format from URL if not provided
+            if not format_param:
+                from urllib.parse import urlparse
+                parsed_url = urlparse(url)
+                url_path = parsed_url.path
+                if '.' in url_path:
+                    ext = os.path.splitext(url_path)[1].lower()
+                    if ext and len(ext) > 1:
+                        format_param = ext[1:] if ext.startswith('.') else ext
+                        logger.info(f"Detected format '{format_param}' from URL")
+            
+            # Stream data directly to memory buffer regardless of file size
+            logger.info(f"Streaming data from URL: {url}")
+            
+            # Open a connection to stream the data
+            with requests.get(url, stream=True) as response:
+                response.raise_for_status()  # Raise an error for bad responses
+                
+                # Read data into an in-memory buffer
+                buffer = io.BytesIO()
+                for chunk in response.iter_content(chunk_size=8192):
+                    buffer.write(chunk)
+                
+                # Rewind the buffer for reading
+                buffer.seek(0)
+                
+                # Process based on format
+                if format_param == 'parquet' or url.endswith('.parquet') or url.endswith('.pq'):
+                    import pyarrow.parquet as pq
+                    table = pq.read_table(buffer)
+                    return table
+                elif format_param == 'feather' or format_param == 'arrow' or url.endswith('.feather') or url.endswith('.arrow'):
+                    reader = pa.ipc.open_file(buffer)
+                    table = reader.read_all()
+                    return table
+                elif format_param == 'csv' or url.endswith('.csv'):
+                    import pyarrow.csv as csv
+                    read_options = csv.ReadOptions(use_threads=True)
+                    parse_options = csv.ParseOptions(delimiter=',')
+                    convert_options = csv.ConvertOptions(strings_can_be_null=True)
+                    table = csv.read_csv(buffer, read_options=read_options, 
+                                     parse_options=parse_options,
+                                     convert_options=convert_options)
+                    return table
+                elif format_param == 'json' or url.endswith('.json'):
+                    # Stream JSON data and use pandas to parse it
+                    # Read into memory as text
+                    text_content = buffer.getvalue().decode('utf-8')
+                    
+                    # Use StringIO for JSON processing
+                    json_buffer = io.StringIO(text_content)
+                    df = pd.read_json(json_buffer)
+                    
+                    # Convert pandas DataFrame to Arrow table
+                    table = pa.Table.from_pandas(df, preserve_index=preserve_index)
+                    return table
+                else:
+                    # Try using to_arrow_table with buffer
+                    try:
+                        return to_arrow_table(buffer, format=format_param, preserve_index=preserve_index)
+                    except Exception as e:
+                        logger.error(f"Primary URL loading failed: {e}") # Log the original error
+                        logger.error(traceback.format_exc()) # Log the full traceback
+                    
+        # Handle in-memory buffer case directly
+        if isinstance(data, (io.BytesIO, io.StringIO)) and format_param:
+            # Make sure the buffer is at the beginning
+            data.seek(0)
+            
+            # Process based on format
+            if format_param == 'parquet':
+                import pyarrow.parquet as pq
+                return pq.read_table(data)
+            elif format_param == 'feather' or format_param == 'arrow':
+                reader = pa.ipc.open_file(data)
+                return reader.read_all()
+            elif format_param == 'csv':
+                import pyarrow.csv as csv
+                read_options = csv.ReadOptions(use_threads=True)
+                parse_options = csv.ParseOptions(delimiter=',')
+                convert_options = csv.ConvertOptions(strings_can_be_null=True)
+                return csv.read_csv(data, read_options=read_options, 
+                                 parse_options=parse_options,
+                                 convert_options=convert_options)
+            elif format_param == 'json':
+                # For JSON, we need to handle StringIO vs BytesIO
+                if isinstance(data, io.BytesIO):
+                    text_content = data.getvalue().decode('utf-8')
+                    json_data = io.StringIO(text_content)
+                else:
+                    json_data = data
+                
+                # Use pandas to parse the JSON
+                df = pd.read_json(json_data)
+                return pa.Table.from_pandas(df, preserve_index=preserve_index)
+            else:
+                raise ValueError(f"Unsupported format for in-memory data: {format_param}")
+        
+        # Handle file paths - detect format if not specified
+        if isinstance(data, str) and os.path.exists(data) and not format_param:
+            ext = os.path.splitext(data)[1].lower()
+            if ext and len(ext) > 1:
+                format_param = ext[1:] if ext.startswith('.') else ext
+                logger.info(f"Detected format '{format_param}' from file path")
+        
+        # Convert to Arrow table directly
+        if format_param:
+            return to_arrow_table(data, format=format_param, preserve_index=preserve_index)
+        else:
+            return to_arrow_table(data, preserve_index=preserve_index)
+    
+    except Exception as e:
+        logger.error(f"Error converting to Arrow table: {e}")
+        logger.error(traceback.format_exc())
+        
+        # Try a resilient fallback for large files if we know the format
+        if isinstance(data, str) and (data.startswith('http://') or data.startswith('https://')) and format_param:
+            try:
+                logger.info(f"Attempting resilient fallback for large file with format {format_param}")
+                import pandas as pd
+                
+                if format_param == 'parquet':
+                    df = pd.read_parquet(data)
+                elif format_param == 'csv':
+                    df = pd.read_csv(data)
+                elif format_param in ('feather', 'arrow'):
+                    df = pd.read_feather(data)
+                elif format_param == 'json':
+                    df = pd.read_json(data)
+                else:
+                    raise ValueError(f"Unsupported format for fallback: {format_param}")
+                
+                # Convert pandas DataFrame to Arrow table
+                return pa.Table.from_pandas(df, preserve_index=preserve_index)
+            except Exception as fallback_error:
+                logger.error(f"Fallback also failed: {fallback_error}")
+        
+        raise ValueError(f"Failed to convert data to Arrow table: {e}")
+
+
 def parallel_map(
     fn: Callable[[T], R],
     items: List[T],
@@ -488,12 +664,37 @@ def parallel_map(
     """
     if not items:
         return []
-        
+    
+    # Set max_workers if not defined
     if max_workers is None:
         max_workers = min(32, os.cpu_count() + 4)
-        
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        return list(executor.map(fn, items, chunksize=chunk_size, timeout=timeout))
+    
+    # Create a fixed-size thread pool for processing
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks and get futures
+            if timeout is not None:
+                # With timeout handling
+                future_to_index = {executor.submit(fn, item): i for i, item in enumerate(items)}
+                results = [None] * len(items)
+                
+                # Process results as they complete
+                for future in concurrent.futures.as_completed(future_to_index, timeout=timeout):
+                    index = future_to_index[future]
+                    try:
+                        results[index] = future.result()
+                    except Exception as e:
+                        logger.error(f"Error in parallel_map task {index}: {e}")
+                        raise  # Re-raise to maintain similar behavior
+                
+                return results
+            else:
+                # Without timeout - simpler approach using map
+                return list(executor.map(fn, items, chunksize=chunk_size))
+    
+    except concurrent.futures.TimeoutError:
+        logger.warning(f"Timeout exceeded in parallel_map after {timeout} seconds")
+        raise
 
 def process_arrow_batches_parallel(
     fn: Callable[[pa.RecordBatch], pa.RecordBatch],
@@ -516,34 +717,22 @@ def process_arrow_batches_parallel(
     if table.num_rows == 0:
         return table
     
-    # Create batches
-    total_rows = table.num_rows
-    
-    # Adjust batch size based on thread count for better parallelism
+    # Set max_workers if not defined
     if max_workers is None:
         max_workers = min(32, os.cpu_count() + 4)
     
-    # Target at least 2-4 batches per thread for better utilization
-    target_batch_count = max_workers * 3
-    adjusted_rows_per_batch = max(1000, min(max_rows_per_batch, 
-                                          total_rows // target_batch_count))
-    
-    num_batches = (total_rows + adjusted_rows_per_batch - 1) // adjusted_rows_per_batch
-    
-    # Create record batches
-    batches = []
-    for i in range(num_batches):
-        start = i * adjusted_rows_per_batch
-        end = min(start + adjusted_rows_per_batch, total_rows)
-        # Use slice and to_batches to efficiently create record batches
-        batch = table.slice(start, end - start).to_batches()[0]
-        batches.append(batch)
+    # Use Arrow's built-in batching functionality for better efficiency
+    # This creates batches without copying the data
+    batches = table.to_batches(max_chunksize=max_rows_per_batch)
     
     # Process batches in parallel
-    processed_batches = parallel_map(fn, batches, max_workers=max_workers)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        processed_batches = list(executor.map(fn, batches))
     
-    # Combine processed batches back into a table
-    return pa.Table.from_batches(processed_batches)
+    # Use Arrow's built-in concat functionality to combine batches
+    return pa.concat_tables([
+        pa.Table.from_batches([batch]) for batch in processed_batches
+    ])
 
 def apply_arrow_compute_parallel(
     compute_fn: Callable[[pa.ChunkedArray], pa.ChunkedArray],
@@ -563,37 +752,48 @@ def apply_arrow_compute_parallel(
     Returns:
         New Arrow table with processed columns
     """
-    if not column_names:
+    if not column_names or table.num_rows == 0:
         return table
     
+    # Set max_workers if not defined
     if max_workers is None:
         max_workers = min(32, os.cpu_count() + 4)
     
+    # Only process columns that exist in the table
+    columns_to_process = [col for col in column_names if col in table.column_names]
+    
+    if not columns_to_process:
+        return table
+    
     # Process columns in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Create tasks for processing each column
-        column_tasks = {
-            executor.submit(compute_fn, table[col]): col 
-            for col in column_names if col in table.column_names
+        # Create tasks for processing columns
+        results = {}
+        futures = {
+            executor.submit(compute_fn, table[col]): col for col in columns_to_process
         }
         
-        # Create new columns dict with processed and unprocessed columns
-        new_columns = {}
-        for col in table.column_names:
-            if col in column_names:
-                continue  # Will be added from tasks
-            new_columns[col] = table[col]
-        
-        # Get results from tasks
-        for future in concurrent.futures.as_completed(column_tasks):
-            col_name = column_tasks[future]
+        for future in concurrent.futures.as_completed(futures):
+            col_name = futures[future]
             try:
-                new_columns[col_name] = future.result()
+                results[col_name] = future.result()
             except Exception as e:
                 logger.error(f"Error processing column {col_name}: {e}")
-                # Keep original column on error
-                new_columns[col_name] = table[col_name]
-        
-        # Create new table with all columns
-        columns = [new_columns[name] for name in table.column_names]
-        return pa.Table.from_arrays(columns, names=table.column_names) 
+                # Keep original column
+                results[col_name] = table[col_name]
+    
+    # Efficiently create a new table using Arrow's built-in table construction
+    # First create the schema - preserving field metadata
+    new_schema = pa.schema([
+        pa.field(name, 
+                 results.get(name, table[name]).type, 
+                 nullable=table.schema.field(name).nullable,
+                 metadata=table.schema.field(name).metadata)
+        for name in table.column_names
+    ])
+    
+    # Now create the table using the schema for consistency
+    return pa.Table.from_arrays(
+        [results.get(name, table[name]) for name in table.column_names],
+        schema=new_schema
+    ) 

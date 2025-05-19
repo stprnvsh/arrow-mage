@@ -37,7 +37,7 @@ DEFAULT_CONFIG = {
     "cache_query_plans": True,
     "query_plan_cache_size": 100,  # Number of query plans to cache
     "use_statistics": True,  # Use statistics for query optimization
-    "lazy_duckdb_registration": True,  # Only register tables with DuckDB when queried
+    "lazy_duckdb_registration": False,  # Only register tables with DuckDB when queried
     
     # Storage settings
     "spill_to_disk": True,

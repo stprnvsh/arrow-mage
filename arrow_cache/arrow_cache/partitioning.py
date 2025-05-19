@@ -12,6 +12,7 @@ import threading
 from typing import Dict, List, Optional, Tuple, Union, Set, Any, Iterator
 import json
 import re
+import traceback
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -105,27 +106,59 @@ class TablePartition:
                 return self._table
             
             # Table is not in memory, load it
+            error_messages = []
+            
+            # First try loading from spill path if available
             if self.spill_path and os.path.exists(self.spill_path):
                 try:
-                    self._table = pq.read_table(self.spill_path)
+                    # Check for metadata first for better loading
+                    meta_path = os.path.join(os.path.dirname(self.spill_path), 
+                                           f"{self.partition_id}.meta.json")
+                    
+                    import pyarrow.parquet as pq
+                    
+                    # Use optimized reading options
+                    read_options = {
+                        "use_threads": True,
+                        "use_pandas_metadata": True
+                    }
+                    
+                    # Try to read table
+                    self._table = pq.read_table(self.spill_path, **read_options)
                     self.is_loaded = True
+                    logger.debug(f"Successfully loaded partition {self.partition_id} from spill path")
                     return self._table
                 except Exception as e:
-                    logger.error(f"Failed to load partition from spill path: {e}")
+                    error_msg = f"Failed to load partition from spill path: {e}"
+                    logger.warning(error_msg)
+                    error_messages.append(error_msg)
             
+            # If spill path failed, try persistent path
             if self.path and os.path.exists(self.path):
                 try:
-                    self._table = pq.read_table(self.path)
+                    import pyarrow.parquet as pq
+                    
+                    # Use optimized reading options
+                    read_options = {
+                        "use_threads": True,
+                        "use_pandas_metadata": True
+                    }
+                    
+                    self._table = pq.read_table(self.path, **read_options)
                     self.is_loaded = True
                     return self._table
                 except Exception as e:
-                    logger.error(f"Failed to load partition from path: {e}")
+                    error_msg = f"Failed to load partition from persistent path: {e}"
+                    logger.error(error_msg)
+                    error_messages.append(error_msg)
             
-            raise ValueError(f"Partition {self.partition_id} data not available")
+            # If we get here, both paths failed
+            error_details = "\n".join(error_messages)
+            raise ValueError(f"Partition {self.partition_id} data not available. Errors:\n{error_details}")
     
     def spill(self, spill_dir: str) -> bool:
         """
-        Spill this partition to disk to free memory
+        Spill this partition to disk to free memory using Arrow's I/O
         
         Args:
             spill_dir: Directory to spill to
@@ -145,21 +178,40 @@ class TablePartition:
                 os.makedirs(spill_dir, exist_ok=True)
                 
             try:
-                import tempfile
-                import shutil
-                
-                # Create a temporary file for writing
-                temp_file = tempfile.NamedTemporaryFile(delete=False, dir=spill_dir, suffix='.parquet.tmp')
-                temp_file.close()  # Close the file to allow writing to it
-                
-                # Write to temporary file
-                pq.write_table(self._table, temp_file.name)
-                
                 # Set destination path
                 self.spill_path = os.path.join(spill_dir, f"{self.partition_id}.parquet")
                 
-                # Rename temp file to destination (atomic operation)
-                shutil.move(temp_file.name, self.spill_path)
+                # Write table metadata to JSON for better recovery capabilities
+                meta_path = os.path.join(spill_dir, f"{self.partition_id}.meta.json")
+                try:
+                    spill_metadata = {
+                        "partition_id": self.partition_id,
+                        "size_bytes": self.size_bytes,
+                        "row_count": self.row_count,
+                        "created_at": self.created_at,
+                        "last_accessed_at": self.last_accessed_at,
+                        "access_count": self.access_count,
+                        "format": "parquet",
+                        "schema": str(self._table.schema),
+                        "metadata": self.metadata
+                    }
+                    with open(meta_path, 'w') as f:
+                        json.dump(spill_metadata, f)
+                except Exception as e:
+                    logger.warning(f"Failed to save partition metadata for {self.partition_id}: {e}")
+                
+                # Write directly with Arrow Parquet writer with optimized settings for spill files
+                import pyarrow.parquet as pq
+                
+                # Preserve schema metadata by ensuring it's included in the write
+                writer_options = {
+                    "compression": "zstd",  # Use fast compression for spill files
+                    "compression_level": 1,  # Low compression level for better speed
+                    "version": "2.6",  # Latest version for best compatibility
+                    "store_schema": True,  # Ensure schema is stored with the file
+                }
+                
+                pq.write_table(self._table, self.spill_path, **writer_options)
                 
                 # Release memory
                 self._table = None
@@ -169,22 +221,15 @@ class TablePartition:
                 self.last_spilled_at = time.time()
                 
                 return True
-            except IOError as e:
-                logger.error(f"I/O error spilling partition to disk: {e}")
-                if 'temp_file' in locals() and os.path.exists(temp_file.name):
-                    os.unlink(temp_file.name)
-                self.spill_path = None
-                return False
             except Exception as e:
                 logger.error(f"Failed to spill partition to disk: {e}")
-                if 'temp_file' in locals() and os.path.exists(temp_file.name):
-                    os.unlink(temp_file.name)
+                logger.error(traceback.format_exc())
                 self.spill_path = None
                 return False
     
     def persist(self, storage_dir: str) -> bool:
         """
-        Persist this partition to permanent storage
+        Persist this partition to permanent storage using Arrow's I/O
         
         Args:
             storage_dir: Directory to persist to
@@ -199,61 +244,39 @@ class TablePartition:
                 os.makedirs(storage_dir, exist_ok=True)
                 
             try:
-                import tempfile
-                import shutil
-                
-                # Write table metadata to a temporary file first
+                # Write table metadata
                 meta_path = os.path.join(storage_dir, f"{self.partition_id}.json")
-                meta_temp = tempfile.NamedTemporaryFile(delete=False, dir=storage_dir, suffix='.json.tmp')
-                meta_temp.close()
+                metadata = {
+                    "partition_id": self.partition_id,
+                    "size_bytes": self.size_bytes,
+                    "row_count": self.row_count,
+                    "created_at": self.created_at,
+                    "metadata": self.metadata
+                }
                 
-                with open(meta_temp.name, 'w') as f:
-                    json.dump({
-                        "partition_id": self.partition_id,
-                        "size_bytes": self.size_bytes,
-                        "row_count": self.row_count,
-                        "created_at": self.created_at,
-                        "metadata": self.metadata
-                    }, f)
-                
-                # Move metadata to final location (atomic)
-                shutil.move(meta_temp.name, meta_path)
-                
-                # Write table data to a temporary file
-                temp_file = tempfile.NamedTemporaryFile(delete=False, dir=storage_dir, suffix='.parquet.tmp')
-                temp_file.close()
-                
-                # Write to parquet with compression
-                pq.write_table(
-                    table, 
-                    temp_file.name,
-                    compression='zstd',
-                    compression_level=3
-                )
+                with open(meta_path, 'w') as f:
+                    json.dump(metadata, f)
                 
                 # Set the final path
                 self.path = os.path.join(storage_dir, f"{self.partition_id}.parquet")
                 
-                # Move to final location (atomic)
-                shutil.move(temp_file.name, self.path)
+                # Write to parquet with compression using Arrow directly
+                pq.write_table(
+                    table, 
+                    self.path,
+                    compression='zstd',
+                    compression_level=3
+                )
                 
                 return True
-            except IOError as e:
-                logger.error(f"I/O error persisting partition: {e}")
-                # Clean up temporary files
-                if 'meta_temp' in locals() and os.path.exists(meta_temp.name):
-                    os.unlink(meta_temp.name)
-                if 'temp_file' in locals() and os.path.exists(temp_file.name):
-                    os.unlink(temp_file.name)
-                self.path = None
-                return False
             except Exception as e:
                 logger.error(f"Failed to persist partition: {e}")
-                # Clean up temporary files
-                if 'meta_temp' in locals() and os.path.exists(meta_temp.name):
-                    os.unlink(meta_temp.name)
-                if 'temp_file' in locals() and os.path.exists(temp_file.name):
-                    os.unlink(temp_file.name)
+                # Clean up metadata file if it was created
+                if 'meta_path' in locals() and os.path.exists(meta_path):
+                    try:
+                        os.unlink(meta_path)
+                    except:
+                        pass
                 self.path = None
                 return False
     
@@ -263,7 +286,12 @@ class TablePartition:
             self.is_pinned = True
             # Ensure it's loaded
             if not self.is_loaded:
-                self.get_table()
+                try:
+                    self.get_table()
+                    self.is_loaded = True
+                except Exception as e:
+                    logger.error(f"Failed to load partition {self.partition_id} during pin: {e}")
+                    # Don't clear pin status - we want to keep it pinned even if load failed
     
     def unpin(self) -> None:
         """Unpin this partition, allowing it to be spilled"""
@@ -660,24 +688,60 @@ class PartitionedTable:
         with open(meta_path, 'r') as f:
             metadata = json.load(f)
         
-        # Create table instance - Fix Schema.from_string issue
-        schema_str = metadata["schema"]
+        # Create schema from field information in metadata
+        # First check if we have a full schema string we can interpret
+        schema = None
+        if "schema" in metadata:
+            try:
+                # Try to get the schema from first partition on disk
+                if "partitions" in metadata and metadata["partitions"]:
+                    first_partition = metadata["partitions"][0]
+                    partition_path = os.path.join(table_dir, f"{first_partition}.parquet")
+                    if os.path.exists(partition_path):
+                        # Read just the schema using PyArrow directly
+                        schema = pq.read_schema(partition_path)
+                        logger.info(f"Loaded schema from first partition: {first_partition}")
+            except Exception as e:
+                logger.warning(f"Could not read schema from partition: {e}")
         
-        # Extract field definitions using regex - safe alternative to Schema.from_string
-        field_matches = re.findall(r'Field\((.*?):', schema_str) or re.findall(r'field_name: (.*?)[,\)]', schema_str)
-        field_types = re.findall(r'type: (.*?)[\),]', schema_str)
+        # If we couldn't get schema from partition, create from metadata
+        if schema is None and "schema" in metadata:
+            try:
+                # If metadata includes detailed column info, use it
+                if "columns" in metadata:
+                    fields = []
+                    for col in metadata["columns"]:
+                        name = col["name"]
+                        type_str = col["type"]
+                        nullable = col.get("nullable", True)
+                        field_type = _parse_type_str(type_str)
+                        fields.append(pa.field(name, field_type, nullable=nullable))
+                    schema = pa.schema(fields)
+                else:
+                    # Try to get basic field names from schema string
+                    schema_str = metadata["schema"]
+                    # Safe parsing of schema string
+                    field_names = []
+                    if isinstance(schema_str, str):
+                        # Extract field names using simpler approach
+                        for name in schema_str.replace("schema:", "").split(","):
+                            match = re.search(r'field_name: (\w+)|name: (\w+)|"(\w+)"', name)
+                            if match:
+                                field_name = next(g for g in match.groups() if g is not None)
+                                field_names.append(field_name)
+                
+                    # Create default schema if we found field names
+                    if field_names:
+                        schema = pa.schema([pa.field(name, pa.string()) for name in field_names])
+            except Exception as e:
+                logger.warning(f"Could not parse schema from metadata: {e}")
         
-        # Create fields from extracted information
-        fields = []
-        for i, name in enumerate(field_matches):
-            name = name.strip().strip("'\"")
-            # Default to string type if type extraction fails
-            field_type = pa.string() if i >= len(field_types) else _parse_type_str(field_types[i])
-            fields.append(pa.field(name, field_type))
+        # If we still don't have a schema, create a minimal default one
+        if schema is None:
+            schema = pa.schema([pa.field("value", pa.string())])
+            logger.warning("Using default schema with single string column")
         
-        # Create schema
-        schema = pa.schema(fields)
-        
+        # Create table instance
         table = cls(
             key=key,
             schema=schema,
@@ -708,53 +772,53 @@ class PartitionedTable:
     
     def standardize_partition_schemas(self) -> None:
         """
-        Standardize schemas across all partitions to ensure compatibility
+        Standardize schemas across all partitions to ensure compatibility using native Arrow operations.
         
         This method ensures all partitions have the same schema by:
         1. Determining the most complete schema across all partitions
-        2. Converting each partition to match that schema
+        2. Converting each partition to match that schema using Arrow's type system
         """
         if not self.partition_order:
             return  # No partitions to standardize
-            
+        
         with self.lock:
-            # Collect schema information from all partitions
-            schemas = []
+            # Collect schemas from all partitions
+            partition_schemas = []
             for part_id in self.partition_order:
                 if part_id in self.partitions:
                     partition = self.partitions[part_id]
                     try:
                         table = partition.get_table()
-                        schemas.append((part_id, table.schema))
+                        partition_schemas.append(table.schema)
                     except Exception as e:
                         logger.warning(f"Couldn't get schema for partition {part_id}: {e}")
             
-            if not schemas:
+            if not partition_schemas:
                 logger.error("No valid partition schemas found")
                 return
-                
-            # Find the most complete schema (one with most fields)
-            target_schema = max(schemas, key=lambda s: len(s[1]))[1]
             
-            # Create a reference schema that includes all unique fields with consistent types
-            field_types = {}
-            for _, schema in schemas:
+            # Build a unified schema that includes all fields from all partitions
+            # First, collect all fields by name
+            all_fields = {}
+            for schema in partition_schemas:
                 for field in schema:
                     name = field.name
-                    if name not in field_types:
-                        field_types[name] = field.type
-                    elif pa.types.is_null(field_types[name]) and not pa.types.is_null(field.type):
-                        # Upgrade from null type if a more specific type is found
-                        field_types[name] = field.type
-                    elif (pa.types.is_integer(field_types[name]) and pa.types.is_floating(field.type)):
-                        # Upgrade from int to float if needed
-                        field_types[name] = field.type
+                    if name not in all_fields:
+                        all_fields[name] = field
+                    elif pa.types.is_null(all_fields[name].type) and not pa.types.is_null(field.type):
+                        # Prefer non-null types
+                        all_fields[name] = field
+                    elif (pa.types.is_integer(all_fields[name].type) and pa.types.is_floating(field.type)):
+                        # Prefer float over int for numeric fields
+                        all_fields[name] = field
+                    elif (field.nullable and not all_fields[name].nullable):
+                        # Prefer nullable fields
+                        all_fields[name] = pa.field(name, all_fields[name].type, nullable=True)
             
-            # Create a unified schema with all fields
-            unified_fields = [pa.field(name, dtype) for name, dtype in field_types.items()]
-            unified_schema = pa.schema(unified_fields)
+            # Create unified schema with all fields
+            unified_schema = pa.schema(list(all_fields.values()))
             
-            # Reprocess each partition to match the unified schema
+            # Update each partition to match the unified schema
             for part_id in self.partition_order:
                 if part_id in self.partitions:
                     partition = self.partitions[part_id]
@@ -763,115 +827,94 @@ class PartitionedTable:
                         
                         # Check if schema needs standardization
                         if table.schema != unified_schema:
-                            # Use Arrow compute functions to transform the table
-                            # Create arrays for the new schema
-                            new_arrays = []
+                            # Create a new table with the unified schema
+                            columns = []
                             
-                            # Add each field from the unified schema
+                            # Process each field in the unified schema
                             for field in unified_schema:
                                 if field.name in table.column_names:
-                                    # Use existing column
-                                    new_arrays.append(table[field.name])
+                                    # Use existing column data - cast if types don't match
+                                    src_field = table.schema.field(field.name)
+                                    if src_field.type != field.type:
+                                        # Try to cast the data to the target type
+                                        try:
+                                            columns.append(table[field.name].cast(field.type))
+                                        except pa.ArrowInvalid:
+                                            # If casting fails, use null values
+                                            columns.append(pa.nulls(table.num_rows, type=field.type))
+                                    else:
+                                        columns.append(table[field.name])
                                 else:
-                                    # Create a null array of the appropriate type and length
-                                    null_array = pa.nulls(table.num_rows, type=field.type)
-                                    new_arrays.append(null_array)
+                                    # Add a null array for missing columns
+                                    columns.append(pa.nulls(table.num_rows, type=field.type))
                             
-                            # Create new table with the unified schema
-                            standardized_table = pa.Table.from_arrays(new_arrays, schema=unified_schema)
+                            # Create the standardized table
+                            standardized_table = pa.Table.from_arrays(columns, schema=unified_schema)
                             
-                            # Update the partition with standardized table
+                            # Update the partition
                             self.partitions[part_id]._table = standardized_table
                     except Exception as e:
                         logger.error(f"Failed to standardize schema for partition {part_id}: {e}")
             
-            # Update the schema for this partitioned table
+            # Update the schema for the partitioned table
             self.schema = unified_schema
 
     def recalculate_total_size(self) -> None:
         """
-        Recalculate the total size of this partitioned table accurately.
+        Recalculate the total size of this partitioned table using Arrow's memory estimation.
         
-        This helps repair incorrect size calculations that may have occurred
-        due to double-counting of slice memory and ensures consistent size
-        tracking across the codebase.
+        Uses Arrow's native memory tracking to get accurate memory size estimates for
+        partitioned tables, avoiding the need for manual tracking or double-counting.
         """
         with self.lock:
             from arrow_cache.memory import estimate_table_memory_usage
             old_size = self.total_size_bytes
             
-            # We'll use two approaches and take the more conservative estimate
-            
-            # Approach 1: Use estimate_table_memory_usage on each partition
+            # Measure each partition directly with Arrow
             total_size = 0
             partition_sizes = {}
             
             for partition_id in self.partition_order:
                 partition = self.partitions[partition_id]
-                table = partition.get_table()
-                size = estimate_table_memory_usage(table)
-                partition_sizes[partition_id] = size
-                total_size += size
-                
-            # Approach 2: If number of partitions is reasonable, try getting the combined table
-            # and measuring it directly (this catches some reference sharing between partitions)
-            combined_size = None
-            if len(self.partition_order) <= 5:  # Only for small numbers of partitions
                 try:
-                    # Get the full table and measure it
-                    full_table = self.get_table()  
-                    combined_size = estimate_table_memory_usage(full_table)
-                    
-                    # Use the smaller of the two estimates (to account for shared memory)
-                    if combined_size and combined_size < total_size:
-                        logger.debug(f"Using combined table size estimate ({combined_size/(1024*1024):.2f} MB) "
-                                    f"instead of sum of partitions ({total_size/(1024*1024):.2f} MB)")
-                        total_size = combined_size
+                    table = partition.get_table()
+                    # Use Arrow's native memory estimation
+                    size = estimate_table_memory_usage(table)
+                    partition_sizes[partition_id] = size
+                    total_size += size
                 except Exception as e:
-                    logger.debug(f"Error getting combined size estimate: {e}")
-            
-            # Set the new size
-            self.total_size_bytes = total_size
+                    logger.warning(f"Error measuring partition {partition_id}: {e}")
+                    # Use existing size if available
+                    if hasattr(partition, 'size_bytes') and partition.size_bytes > 0:
+                        partition_sizes[partition_id] = partition.size_bytes
+                        total_size += partition.size_bytes
             
             # Sanity check: cap at system memory
-            import psutil
             system_memory = psutil.virtual_memory().total
-            if self.total_size_bytes > system_memory * 0.8:
-                logger.info(f"Memory size ({self.total_size_bytes/(1024*1024*1024):.2f} GB) exceeds 80% of system memory "
+            if total_size > system_memory * 0.8:
+                logger.info(f"Memory size ({total_size/(1024*1024*1024):.2f} GB) exceeds 80% of system memory "
                           f"({(system_memory * 0.8)/(1024*1024*1024):.2f} GB), adjusting to realistic value.")
-                self.total_size_bytes = int(system_memory * 0.8)
+                total_size = int(system_memory * 0.8)
             
-            # Update each partition based on its proportion of rows or directly from measurement
-            total_rows = max(1, self.total_rows)
+            # Update the total size
+            self.total_size_bytes = total_size
+            
+            # Update each partition with its measured size
             for partition_id in self.partition_order:
-                partition = self.partitions[partition_id]
                 if partition_id in partition_sizes:
-                    # Use directly measured size if we have it
-                    partition.size_bytes = partition_sizes[partition_id]
+                    self.partitions[partition_id].size_bytes = partition_sizes[partition_id]
                 else:
-                    # Fall back to proportional allocation
-                    row_proportion = partition.row_count / total_rows
+                    # If we couldn't measure a partition, estimate based on row proportion
+                    partition = self.partitions[partition_id]
+                    row_proportion = partition.row_count / max(1, self.total_rows)
                     partition.size_bytes = int(self.total_size_bytes * row_proportion)
             
-            # Log the change in size if significant, but only at debug level to avoid alarm
-            size_diff = (old_size - self.total_size_bytes) / (1024 * 1024 * 1024)  # Convert to GB
-            if abs(size_diff) > 1:  # Only log if difference is more than 1GB
-                # Use debug instead of warning for size recalculation
-                logger.debug(f"Recalculated size from {old_size/(1024*1024*1024):.2f} GB "
-                          f"to {self.total_size_bytes/(1024*1024*1024):.2f} GB "
-                          f"(difference: {size_diff:.2f} GB)")
-            else:
-                logger.debug(f"Recalculated size from {old_size/(1024*1024)} MB "
-                        f"to {self.total_size_bytes/(1024*1024)} MB "
-                        f"(difference: {(old_size - self.total_size_bytes)/(1024*1024):.2f} MB)")
-                    
-            # Use debug level for large discrepancy logging
-            if old_size > self.total_size_bytes * 2:
-                logger.debug(f"Memory calculation refined: Previous size was "
-                          f"{old_size/(1024*1024*1024):.2f} GB, now {self.total_size_bytes/(1024*1024*1024):.2f} GB")
-            elif self.total_size_bytes > old_size * 2:
-                logger.debug(f"Memory calculation refined: Previous size was "
-                          f"{old_size/(1024*1024*1024):.2f} GB, now {self.total_size_bytes/(1024*1024*1024):.2f} GB")
+            # Log significant size changes
+            size_diff = (old_size - self.total_size_bytes) / (1024 * 1024)  # Convert to MB
+            if abs(size_diff) > 100:  # Only log if difference is more than 100MB
+                logger.debug(f"Recalculated size from {old_size/(1024*1024):.2f} MB "
+                          f"to {self.total_size_bytes/(1024*1024):.2f} MB "
+                          f"(difference: {size_diff:.2f} MB)")
 
 
 def partition_table(
@@ -881,7 +924,7 @@ def partition_table(
     max_bytes_per_partition: int = 100_000_000
 ) -> List[pa.Table]:
     """
-    Partition a large Arrow table into multiple smaller tables
+    Partition a large Arrow table into multiple smaller tables using pure Arrow operations
     
     Args:
         table: Arrow table to partition
@@ -892,26 +935,20 @@ def partition_table(
     Returns:
         List of Arrow tables (partitions)
     """
-    import gc
-    import pyarrow.compute as pc
-    
     total_rows = table.num_rows
     
-    if total_rows == 0:
-        return [table]
-        
-    if total_rows <= max_rows_per_partition:
+    if total_rows == 0 or total_rows <= max_rows_per_partition:
         # Table is small enough - no need to partition
         return [table]
     
     # Use Arrow's memory pool for accurate size estimation
-    # Instead of the inaccurate sampling-based approach
     total_size_estimate = estimate_table_memory_usage(table)
     
-    # Add a reasonable upper bound based on system memory to prevent ridiculous estimates
+    # Get system memory information
     system_memory = psutil.virtual_memory().total
     available_memory = psutil.virtual_memory().available
     
+    # Cap size estimate at a reasonable value
     if total_size_estimate > system_memory:
         logger.warning(f"Size estimate ({total_size_estimate/(1024*1024*1024):.2f} GB) exceeds system memory " 
                        f"({system_memory/(1024*1024*1024):.2f} GB), capping at 75% of system memory")
@@ -939,21 +976,17 @@ def partition_table(
     num_partitions_by_rows = (total_rows + max_rows_per_partition - 1) // max_rows_per_partition
     num_partitions_by_size = (int(total_size_estimate) + max_bytes_per_partition - 1) // max_bytes_per_partition
     
-    # Use a more balanced approach to partitioning based on table size
+    # Determine appropriate partition count based on table size
     if total_size_estimate < 1 * 1024 * 1024 * 1024:  # < 1GB
-        # Small tables: fewer partitions
         max_partitions = 5
         logger.info(f"Small table detected ({total_size_estimate/(1024*1024):.2f} MB). Using at most {max_partitions} partitions.")
     elif total_size_estimate < 5 * 1024 * 1024 * 1024:  # < 5GB
-        # Medium tables: moderate partitioning
         max_partitions = 20
         logger.info(f"Medium table detected ({total_size_estimate/(1024*1024*1024):.2f} GB). Using at most {max_partitions} partitions.")
     elif total_size_estimate < 20 * 1024 * 1024 * 1024:  # < 20GB
-        # Large tables: more partitions
         max_partitions = 50
         logger.info(f"Large table detected ({total_size_estimate/(1024*1024*1024):.2f} GB). Using at most {max_partitions} partitions.")
     else:
-        # Very large tables: most partitions, but still with a reasonable limit
         max_partitions = 100
         logger.info(f"Very large table detected ({total_size_estimate/(1024*1024*1024):.2f} GB). Using at most {max_partitions} partitions.")
     
@@ -963,96 +996,50 @@ def partition_table(
     
     logger.info(f"Final partition count: {num_partitions} (rows-based: {num_partitions_by_rows}, bytes-based: {num_partitions_by_size})")
     
+    # Use Arrow's chunking capabilities to partition the table efficiently
     rows_per_partition = (total_rows + num_partitions - 1) // num_partitions
     
-    # Try to use zero-copy slicing for better memory efficiency
-    try:
-        # Create partitions using zero-copy slicing
+    # For large tables, use Arrow's record batching for efficient memory management
+    if num_partitions > 10 or total_size_estimate > 1 * 1024 * 1024 * 1024:  # > 1GB
+        # Use Arrow's record batch iterators to conserve memory
+        logger.info(f"Using Arrow's record batch approach for large table with {num_partitions} partitions")
+        
+        # Convert to record batches with controlled size
+        batch_size = min(100000, rows_per_partition // 2)
+        batches = table.to_batches(max_chunksize=batch_size)
+        
+        # Group batches into partitions
+        partitions = []
+        current_batches = []
+        current_rows = 0
+        
+        for batch in batches:
+            current_batches.append(batch)
+            current_rows += batch.num_rows
+            
+            if current_rows >= rows_per_partition:
+                # Create a table from the current set of batches
+                partition = pa.Table.from_batches(current_batches)
+                partitions.append(partition)
+                
+                # Reset for next partition
+                current_batches = []
+                current_rows = 0
+        
+        # Handle any remaining batches
+        if current_batches:
+            partition = pa.Table.from_batches(current_batches)
+            partitions.append(partition)
+        
+        return partitions
+    else:
+        # For smaller tables, use Arrow's built-in slicing which is zero-copy
+        logger.info(f"Using Arrow's slice operation for table with {num_partitions} partitions")
+        
         partitions = []
         for i in range(0, total_rows, rows_per_partition):
             end = min(i + rows_per_partition, total_rows)
             partition = table.slice(i, end - i)
             partitions.append(partition)
-            
-            # For extremely large tables, force garbage collection occasionally
-            if num_partitions > 100 and i % (10 * rows_per_partition) == 0:
-                gc.collect()
         
-        return partitions
-        
-    except Exception as e:
-        # If zero-copy slicing fails for some reason, try an Arrow-based fallback
-        # that avoids going through Python objects when possible
-        logger.warning(f"Zero-copy slicing failed: {e}. Using Arrow take-based partitioning.")
-        
-        try:
-            # Use Arrow's take function which is more memory-efficient than Python lists
-            partitions = []
-            schema = table.schema
-            
-            for i in range(0, total_rows, rows_per_partition):
-                end = min(i + rows_per_partition, total_rows)
-                rows_in_partition = end - i
-                
-                # Create indices for this partition
-                indices = list(range(i, end))
-                indices_array = pa.array(indices)
-                
-                # Use Arrow's take function to extract rows by index
-                try:
-                    # Try to use faster batch processing with Arrow compute take function
-                    arrays = []
-                    for col in table.columns:
-                        arrays.append(pc.take(col, indices_array))
-                    
-                    # Create new table from these arrays
-                    partition = pa.Table.from_arrays(arrays, schema=schema)
-                    partitions.append(partition)
-                except:
-                    # If take fails (sometimes happens with complex types), 
-                    # fall back to per-row slice + concatenate
-                    partition = table.slice(i, rows_in_partition)
-                    partitions.append(partition)
-                
-                # Force garbage collection for very large tables
-                if num_partitions > 50 and i % (5 * rows_per_partition) == 0:
-                    gc.collect()
-                    
-            return partitions
-            
-        except Exception as compute_error:
-            # If Arrow-based approach also fails, fall back to most compatible method
-            # but still try to avoid Python objects when possible
-            logger.warning(f"Arrow compute-based partitioning failed: {compute_error}. Using most compatible method.")
-            
-            # Record batch processing can be more memory-efficient
-            partitions = []
-            
-            # Convert table to record batches with appropriate size
-            batch_size = min(100000, rows_per_partition)
-            batches = table.to_batches(max_chunksize=batch_size)
-            
-            # Group batches into partitions
-            current_partition_batches = []
-            current_row_count = 0
-            
-            for batch in batches:
-                current_partition_batches.append(batch)
-                current_row_count += len(batch)
-                
-                if current_row_count >= rows_per_partition:
-                    # We have enough rows for a partition, create table from batches
-                    partition = pa.Table.from_batches(current_partition_batches)
-                    partitions.append(partition)
-                    
-                    # Reset for next partition
-                    current_partition_batches = []
-                    current_row_count = 0
-                    gc.collect()  # Force garbage collection
-            
-            # Add any remaining batches as the last partition
-            if current_partition_batches:
-                partition = pa.Table.from_batches(current_partition_batches)
-                partitions.append(partition)
-            
-            return partitions 
+        return partitions 

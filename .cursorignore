@@ -12,3 +12,7 @@
 !*.cmake
 !*.toml
 !*.docx
+!*.js
+!*.tsx
+!*.html
+!*.css

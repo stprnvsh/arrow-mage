@@ -168,8 +168,8 @@ class QueryOptimizer:
         # Fix date/time function compatibility issues
         optimized_sql = self._fix_date_functions(optimized_sql)
         
-        # Fix table references that look like function calls
-        optimized_sql = self._fix_table_references(optimized_sql)
+        # We no longer transform table references to avoid breaking valid table names
+        # optimized_sql = self._fix_table_references(optimized_sql)
         
         # Check for optimization opportunities using regex patterns
         for name, pattern_info in self._hint_patterns.items():
@@ -308,47 +308,10 @@ class QueryOptimizer:
         Returns:
             SQL query with fixed table references
         """
-        original_sql = sql
-        
-        # Pattern to match table references that look like function calls
-        # like "_cache_nyc_yellow_taxi_(jan_2023)" or "_cache_nyc_yellow_taxi_ (jan_2023)"
-        # Updated regex to better handle spaces before parentheses
-        pattern = re.compile(r'(FROM|JOIN)\s+(_cache_[a-zA-Z0-9_]+)(\s*\(\s*[^)]*\s*\))', re.IGNORECASE)
-        
-        # Function to replace matches
-        def replace_func(match):
-            clause = match.group(1)  # FROM or JOIN
-            table_name = match.group(2)  # _cache_table
-            params = match.group(3)  # (params)
-            
-            # Extract the parameter content without parentheses
-            # Improved to handle extra whitespace
-            param_content = re.sub(r'^\s*\(\s*|\s*\)\s*$', '', params).strip()
-            
-            # Convert to proper table syntax: 
-            # "_cache_table(param)" becomes "_cache_table_param"
-            if param_content:
-                # Clean param_content to be part of an identifier
-                clean_param = re.sub(r'[^a-zA-Z0-9_]', '_', param_content)
-                new_table = f'{table_name}_{clean_param}'
-                return f'{clause} {new_table}'
-            else:
-                return f'{clause} {table_name}'
-        
-        # Replace in the SQL
-        modified_sql = pattern.sub(replace_func, sql)
-        
-        # Also check for table names in subqueries
-        subquery_pattern = re.compile(r'(\(\s*SELECT[^)]*?FROM\s+)(_cache_[a-zA-Z0-9_]+)(\s*\(\s*[^)]*\s*\))', re.IGNORECASE | re.DOTALL)
-        modified_sql = subquery_pattern.sub(lambda m: m.group(1) + replace_func(m).split(' ', 1)[1], modified_sql)
-        
-        # Log if any changes were made
-        if modified_sql != original_sql:
-            logger.info("Fixed table references that looked like function calls")
-            logger.debug(f"Original SQL: {original_sql}")
-            logger.debug(f"Fixed SQL: {modified_sql}")
-        
-        return modified_sql
+        # Don't modify the query at all - keep exact table names
+        # This is a temporary fix to prevent incorrect transformations
+        # that break queries with complex table names
+        return sql
     
     def get_cached_plan(self, sql: str) -> Optional[QueryPlan]:
         """
@@ -436,11 +399,15 @@ class QueryOptimizer:
         start_time = time.time()
         table_refs = []
         
-        # First, extract table references and ensure they're registered
+        # Extract table references and ensure they're registered
         table_refs = self._extract_table_references(sql)
         if table_refs and ensure_tables_callback:
             # Call back to the cache to ensure these tables are registered
-            ensure_tables_callback(table_refs)
+            try:
+                ensure_tables_callback(table_refs)
+                logger.debug(f"Ensured tables are registered: {table_refs}")
+            except Exception as e:
+                logger.warning(f"Error ensuring tables are registered: {e}")
             
         cached_plan = self.get_cached_plan(sql)
         
@@ -452,12 +419,10 @@ class QueryOptimizer:
             optimization_time = 0
         else:
             # No cached plan, optimize the query
-            # Acquire lock for optimization and plan caching to ensure thread safety
             with self.lock:
-                # Check again after acquiring the lock to prevent race conditions
                 cached_plan = self.get_cached_plan(sql)
                 if cached_plan:
-                    # Another thread cached the plan while we were waiting for the lock
+                    # Another thread cached the plan while we were waiting
                     optimization_hints = []
                     optimized_sql = sql
                     plan = cached_plan.plan
@@ -469,28 +434,131 @@ class QueryOptimizer:
                     plan = self.get_query_plan(con, optimized_sql)
                     optimization_time = time.time() - optimization_start
         
+        # Update SQL to properly quote table names with special characters
+        modified_sql = optimized_sql
+        
+        # First try to handle direct table references with parentheses
+        # Look for unquoted tables with the cache_ prefix and parentheses pattern
+        for table_ref in table_refs:
+            # If the table reference contains parentheses and isn't already quoted
+            if '(' in table_ref and ')' in table_ref and f'"{table_ref}"' not in modified_sql:
+                # Replace unquoted reference with quoted reference
+                # Use regex to match the table reference precisely
+                escaped_ref = re.escape(table_ref)
+                modified_sql = re.sub(
+                    fr'(FROM|JOIN)\s+{escaped_ref}(?!\s*AS|\s+[a-zA-Z]|\s*")',
+                    fr'\1 "{table_ref}"',
+                    modified_sql,
+                    flags=re.IGNORECASE
+                )
+        
+        # Also do a general pass to catch any table with parentheses
+        # This regex looks for any table_name(param) pattern that's not quoted
+        table_with_paren_pattern = re.compile(r'(FROM|JOIN)\s+([a-zA-Z0-9_]+\s*\([^)]*\))(?!\s*AS|\s+[a-zA-Z]|\s*")', re.IGNORECASE)
+        for match in table_with_paren_pattern.finditer(optimized_sql):
+            table_with_params = match.group(2).strip()
+            # Add quotes if not already quoted
+            if f'"{table_with_params}"' not in modified_sql:
+                escaped_ref = re.escape(table_with_params)
+                modified_sql = re.sub(
+                    fr'(FROM|JOIN)\s+{escaped_ref}(?!\s*AS|\s+[a-zA-Z]|\s*")',
+                    fr'\1 "{table_with_params}"',
+                    modified_sql,
+                    flags=re.IGNORECASE
+                )
+        
         # Execute the optimized query
         execution_start = time.time()
         result = None
         try:
-            result = con.execute(optimized_sql).arrow()
-        except Exception as e:
+            # Try to execute the query with quoted table names
+            logger.debug(f"Executing SQL with quoted table names: {modified_sql}")
+            result = con.execute(modified_sql).arrow()
+        except Exception as first_error:
+            error_msg = str(first_error)
+            logger.warning(f"Error executing query: {error_msg}")
+            
             # Check if the error is about missing tables
-            if "Table with name" in str(e) and "does not exist" in str(e) and ensure_tables_callback:
-                logger.warning(f"Table not found error, trying to register tables and retry: {e}")
-                # Extract table references again - the first attempt might have missed some
-                table_refs = self._extract_table_references(optimized_sql)
-                if table_refs:
-                    # Register the tables and retry
-                    ensure_tables_callback(table_refs)
-                    # Try again with the registered tables
-                    result = con.execute(optimized_sql).arrow()
-                else:
-                    # If we can't extract table references, re-raise the original error
-                    raise
+            if "Table with name" in error_msg and "does not exist" in error_msg and ensure_tables_callback:
+                # Extract the table name from the error message
+                table_name_match = re.search(r"Table with name ([^\s]+) does not exist", error_msg)
+                if table_name_match:
+                    missing_table = table_name_match.group(1).strip('"')
+                    logger.info(f"Detected missing table: {missing_table}")
+                    
+                    # Try to find a matching table with original parentheses syntax
+                    original_table_refs = self._extract_table_references(sql)
+                    for ref in original_table_refs:
+                        # Check if this is a cache table with parentheses
+                        if '(' in ref and ')' in ref:
+                            logger.info(f"Original table reference with parentheses: {ref}")
+                            try:
+                                # Try to register this specific table
+                                ensure_tables_callback([ref])
+                                logger.info(f"Registered table with original format: {ref}")
+                            except Exception as e:
+                                logger.warning(f"Failed to register table {ref}: {e}")
+                
+                # Try to register all tables again
+                try:
+                    table_refs = self._extract_table_references(optimized_sql)
+                    if table_refs:
+                        ensure_tables_callback(table_refs)
+                        # Try again with the registered tables and quoted table names
+                        result = con.execute(modified_sql).arrow()
+                    else:
+                        # If we can't extract table references, re-raise the original error
+                        raise first_error
+                except Exception as retry_error:
+                    # If we still get an error, try with the original SQL
+                    logger.warning(f"Retry failed, attempting with original SQL: {retry_error}")
+                    try:
+                        # Try with the original SQL but with quoted table names
+                        original_with_quotes = sql
+                        for table_ref in table_refs:
+                            if '(' in table_ref and ')' in table_ref and f'"{table_ref}"' not in original_with_quotes:
+                                escaped_ref = re.escape(table_ref)
+                                original_with_quotes = re.sub(
+                                    fr'(FROM|JOIN)\s+{escaped_ref}(?!\s*AS|\s+[a-zA-Z]|\s*")',
+                                    fr'\1 "{table_ref}"',
+                                    original_with_quotes,
+                                    flags=re.IGNORECASE
+                                )
+                        
+                        # Also apply the general pattern to catch any missed tables with parentheses
+                        table_with_paren_pattern = re.compile(r'(FROM|JOIN)\s+([a-zA-Z0-9_]+\s*\([^)]*\))(?!\s*AS|\s+[a-zA-Z]|\s*")', re.IGNORECASE)
+                        for match in table_with_paren_pattern.finditer(sql):
+                            table_with_params = match.group(2).strip()
+                            # Add quotes if not already quoted
+                            if f'"{table_with_params}"' not in original_with_quotes:
+                                escaped_ref = re.escape(table_with_params)
+                                original_with_quotes = re.sub(
+                                    fr'(FROM|JOIN)\s+{escaped_ref}(?!\s*AS|\s+[a-zA-Z]|\s*")',
+                                    fr'\1 "{table_with_params}"',
+                                    original_with_quotes,
+                                    flags=re.IGNORECASE
+                                )
+                                
+                        logger.debug(f"Trying original SQL with quotes: {original_with_quotes}")
+                        result = con.execute(original_with_quotes).arrow()
+                    except Exception:
+                        # Last resort: try directly replacing the problematic pattern
+                        try:
+                            # Handle specific pattern cache_name(param) -> "cache_name(param)"
+                            direct_fix = re.sub(
+                                r'(FROM|JOIN)\s+((?:_)?cache_[a-zA-Z0-9_]+\s*\([^)]*\))',
+                                r'\1 "\2"',
+                                sql,
+                                flags=re.IGNORECASE
+                            )
+                            logger.debug(f"Trying direct pattern replacement: {direct_fix}")
+                            result = con.execute(direct_fix).arrow()
+                        except Exception:
+                            # Very last resort: try the original unmodified query
+                            result = con.execute(sql).arrow()
             else:
                 # Not a missing table error or no callback to register tables, re-raise
-                raise
+                raise first_error
                 
         execution_time = time.time() - execution_start
         
@@ -529,75 +597,33 @@ class QueryOptimizer:
         Returns:
             List of table references
         """
-        # First, fix any table references that might be function calls
-        fixed_sql = self._fix_table_references(sql)
-        
-        # Simple regex-based extraction - handles common patterns
-        # Find tables in FROM clauses - also handle table names with parentheses
-        # This pattern accounts for cases like "_cache_nyc_yellow_taxi_(jan_2023)"
-        # which should be treated as a table name, not a function call
-        
-        # First, search for potential function-like patterns that are actually table references
-        func_table_pattern = re.compile(r'FROM\s+(_cache_)?([a-zA-Z0-9_]+)(\s*\([^)]*\))', re.IGNORECASE)
-        func_matches = func_table_pattern.findall(sql)
-        
-        # Regular table reference pattern
-        from_tables = re.findall(r'FROM\s+(_cache_)?([a-zA-Z0-9_]+)', fixed_sql, re.IGNORECASE)
-        
-        # Find tables in JOIN clauses
-        join_tables = re.findall(r'JOIN\s+(_cache_)?([a-zA-Z0-9_]+)', fixed_sql, re.IGNORECASE)
-        
-        # Also check for function-like tables in JOIN clauses
-        join_func_matches = re.findall(r'JOIN\s+(_cache_)?([a-zA-Z0-9_]+)(\s*\([^)]*\))', sql, re.IGNORECASE)
-        
-        # Process function-like matches to get the full table name with parentheses
         tables = []
-        for prefix, table, params in func_matches:
-            # Skip common SQL keywords that might be mistaken for tables
-            if table.lower() in ('select', 'where', 'group', 'order', 'having', 'limit', 'offset'):
-                continue
-            
-            # Extract parameter content
-            param_content = re.sub(r'^\s*\(\s*|\s*\)\s*$', '', params).strip()
-            if param_content:
-                # Create both versions of the table name
-                full_table_name = table + params.strip()
-                tables.append(table)
-                
-                # Add the transformed name that will be used in the query
-                clean_param = re.sub(r'[^a-zA-Z0-9_]', '_', param_content)
-                transformed_name = f"{table}_{clean_param}"
-                tables.append(transformed_name)
-            else:
-                tables.append(table)
-                
-        # Process join function-like matches similarly
-        for prefix, table, params in join_func_matches:
-            # Skip common SQL keywords
-            if table.lower() in ('select', 'where', 'group', 'order', 'having', 'limit', 'offset'):
-                continue
-            
-            # Extract parameter content
-            param_content = re.sub(r'^\s*\(\s*|\s*\)\s*$', '', params).strip()
-            if param_content:
-                # Create both versions of the table name
-                full_table_name = table + params.strip()
-                tables.append(table)
-                
-                # Add the transformed name that will be used in the query
-                clean_param = re.sub(r'[^a-zA-Z0-9_]', '_', param_content)
-                transformed_name = f"{table}_{clean_param}"
-                tables.append(transformed_name)
-            else:
-                tables.append(table)
         
-        # Combine and process regular table references
-        for prefix, table in from_tables + join_tables:
-            # Skip common SQL keywords that might be mistaken for tables
-            if table.lower() in ('select', 'where', 'group', 'order', 'having', 'limit', 'offset'):
+        # First look for both forms of cache table patterns with parentheses
+        # Format: _cache_name(param) or cache_name(param)
+        cache_pattern = re.compile(r'(FROM|JOIN)\s+((?:_)?cache_[a-zA-Z0-9_]+\s*\([^)]*\))', re.IGNORECASE)
+        for match in cache_pattern.finditer(sql):
+            table_with_params = match.group(2).strip()
+            tables.append(table_with_params)
+            
+        # Also look for quoted table references that may have special characters
+        # Format: "table_name" or "_cache_name" or "cache_name"
+        quoted_pattern = re.compile(r'(FROM|JOIN)\s+"([^"]+)"', re.IGNORECASE)
+        for match in quoted_pattern.finditer(sql):
+            table_name = match.group(2).strip()
+            if (table_name.startswith('_cache_') or table_name.startswith('cache_')) and table_name not in tables:
+                tables.append(table_name)
+        
+        # Standard table references without parentheses
+        std_pattern = re.compile(r'(FROM|JOIN)\s+([a-zA-Z0-9_\.]+)(?!\s*\(|\s*")', re.IGNORECASE)
+        for match in std_pattern.finditer(sql):
+            table_name = match.group(2).strip()
+            # Skip if it's a SQL keyword
+            if table_name.lower() in ('select', 'where', 'group', 'order', 'having', 'limit', 'offset'):
                 continue
-            # Add the table name
-            tables.append(table)
+            # For cache tables, include them
+            if (table_name.startswith('_cache_') or table_name.startswith('cache_')) and table_name not in tables:
+                tables.append(table_name)
         
         # Remove duplicates while preserving order
         seen = set()
@@ -774,4 +800,157 @@ def explain_query(con: duckdb.DuckDBPyConnection, sql: str) -> str:
         return "\n".join(explanation)
     except Exception as e:
         logger.warning(f"Failed to explain query: {e}")
-        return "Unable to explain query" 
+        return "Unable to explain query"
+
+
+def extract_table_references(sql):
+    """
+    Extract table references from a SQL query
+    
+    Args:
+        sql: SQL query
+        
+    Returns:
+        List of table references
+    """
+    # Extract tables using a combination of regex patterns
+    tables = []
+    
+    # Special pattern for function-like syntax: table_(params)
+    function_pattern = re.compile(r'(FROM|JOIN)\s+(_?cache_[a-zA-Z0-9_]+)_?\s*\(([^)]*)\)', re.IGNORECASE)
+    for match in function_pattern.finditer(sql):
+        # Reconstruct the full table name with parentheses
+        table_base = match.group(2)
+        params = match.group(3)
+        
+        # Handle trailing underscore
+        if table_base.endswith('_'):
+            full_table = f"{table_base[:-1]}({params})"
+        else:
+            full_table = f"{table_base}({params})"
+            
+        # Add to our tables list
+        if full_table not in tables:
+            tables.append(full_table)
+    
+    # Regular expression patterns to match table names in different SQL contexts
+    patterns = [
+        # FROM clause
+        r'FROM\s+(?:"|`)?(_?cache_[a-zA-Z0-9_]+(?:\s*\([^)]*\))?)(?:"|`)?',
+        # JOIN clause 
+        r'JOIN\s+(?:"|`)?(_?cache_[a-zA-Z0-9_]+(?:\s*\([^)]*\))?)(?:"|`)?',
+        # UPDATE clause
+        r'UPDATE\s+(?:"|`)?(_?cache_[a-zA-Z0-9_]+(?:\s*\([^)]*\))?)(?:"|`)?',
+        # INSERT INTO clause
+        r'INSERT\s+INTO\s+(?:"|`)?(_?cache_[a-zA-Z0-9_]+(?:\s*\([^)]*\))?)(?:"|`)?',
+    ]
+    
+    for pattern in patterns:
+        matches = re.finditer(pattern, sql, re.IGNORECASE)
+        for match in matches:
+            table_ref = match.group(1).strip()
+            # Skip if already added
+            if table_ref not in tables:
+                tables.append(table_ref)
+    
+    # Filter out SQL keywords that might be mistaken for tables
+    sql_keywords = {'select', 'from', 'where', 'group', 'order', 'by', 'having', 
+                   'join', 'inner', 'outer', 'left', 'right', 'cross', 'limit'}
+    tables = [t for t in tables if t.lower() not in sql_keywords]
+    
+    return tables
+
+
+def prepare_query_for_execution(conn, sql, table_registry_callback=None):
+    """
+    Prepare a SQL query for execution by ensuring tables are registered
+    and properly quoted.
+    
+    Args:
+        conn: DuckDB connection
+        sql: SQL query
+        table_registry_callback: Callback to register tables
+        
+    Returns:
+        Prepared SQL query
+    """
+    # Extract table references
+    table_refs = extract_table_references(sql)
+    
+    # Register tables if needed
+    if table_registry_callback and table_refs:
+        table_registry_callback(table_refs)
+    
+    # Special case: Handle function-like syntax where table_(params) is used
+    # This pattern captures: FROM table_(params) or JOIN table_(params)
+    function_pattern = re.compile(r'(FROM|JOIN)\s+(_?cache_[a-zA-Z0-9_]+)_?\s*\(([^)]*)\)', re.IGNORECASE)
+    
+    # Replace function-like references with properly quoted table references
+    modified_sql = sql
+    for match in function_pattern.finditer(sql):
+        clause = match.group(1)      # FROM or JOIN
+        table_base = match.group(2)  # table name without parameters
+        params = match.group(3)      # parameters inside parentheses
+        
+        # Build the proper quoted reference
+        if table_base.endswith('_'):
+            # Handle trailing underscore case: FROM table_(params) -> FROM "table(params)"
+            quoted_ref = f'"{table_base[:-1]}({params})"'
+        else:
+            # Standard case: FROM table(params) -> FROM "table(params)"
+            quoted_ref = f'"{table_base}({params})"'
+        
+        # Replace in the SQL (match the whole pattern)
+        original_text = match.group(0)
+        replacement = f"{clause} {quoted_ref}"
+        modified_sql = modified_sql.replace(original_text, replacement, 1)
+    
+    # Now handle other cases where table names need quoting
+    for table_ref in table_refs:
+        if '(' in table_ref and ')' in table_ref and not (table_ref.startswith('"') and table_ref.endswith('"')):
+            # Need to quote this table reference, but only if not already handled by the function pattern
+            quoted_ref = f'"{table_ref}"'
+            
+            # Replace unquoted references with quoted ones, only for whole words
+            pattern = r'(FROM|JOIN|UPDATE|INSERT\s+INTO)\s+' + re.escape(table_ref) + r'\b'
+            replacement = r'\1 ' + quoted_ref
+            
+            # Only replace if not already replaced by the function pattern
+            if re.search(pattern, modified_sql, re.IGNORECASE):
+                modified_sql = re.sub(pattern, replacement, modified_sql, flags=re.IGNORECASE)
+    
+    return modified_sql
+
+
+def optimize_and_execute(conn, sql, ensure_tables_callback=None, deregister_tables_callback=None):
+    """
+    Optimize and execute a SQL query.
+    
+    Args:
+        conn: DuckDB connection
+        sql: SQL query
+        ensure_tables_callback: Callback to ensure tables are registered
+        deregister_tables_callback: Callback to deregister tables after execution
+        
+    Returns:
+        Tuple of (result table, optimization hints, execution info)
+    """
+    # First, prepare the query by ensuring tables are registered and properly quoted
+    prepared_sql = prepare_query_for_execution(conn, sql, ensure_tables_callback)
+    
+    # Execute the prepared query
+    try:
+        start_time = time.time()
+        result = conn.execute(prepared_sql).arrow()
+        execution_time = time.time() - start_time
+        execution_info = {"execution_time": execution_time}
+        
+        # Deregister tables if requested
+        if deregister_tables_callback:
+            table_refs = extract_table_references(sql)
+            deregister_tables_callback(table_refs)
+        
+        return result, [], execution_info
+    except Exception as e:
+        logger.warning(f"Error executing query: {e}")
+        raise 

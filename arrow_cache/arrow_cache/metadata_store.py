@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import logging
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +28,28 @@ class MetadataStore:
         self.con = duckdb.connect(self.db_path)
         self.con_lock = threading.RLock()
         self.lazy_registration = lazy_registration
+        self._initialize_extensions()
         self._initialize_tables()
     
+    def _initialize_extensions(self) -> None:
+        """Install and load required DuckDB extensions.
+        
+        This is called during MetadataStore initialization.
+        """
+        # Attempt to install and load the spatial extension
+        try:
+            logger.info("Attempting to install DuckDB spatial extension...")
+            self.con.execute("INSTALL spatial;")
+            logger.info("Spatial extension installed (or already present).")
+            
+            logger.info("Attempting to load DuckDB spatial extension...")
+            self.con.execute("LOAD spatial;")
+            logger.info("Spatial extension loaded successfully.")
+        except Exception as e:
+            logger.warning(f"Failed to install or load DuckDB spatial extension: {e}. "
+                           f"Spatial functions may not be available.")
+            # Continue without the extension if it fails
+            
     def _initialize_tables(self) -> None:
         """Create metadata tables if they don't exist."""
         # Cache entries table stores basic information about each cached item
@@ -42,7 +63,17 @@ class MetadataStore:
                 size_bytes BIGINT,
                 schema_json VARCHAR,
                 num_rows BIGINT,
-                metadata_json VARCHAR
+                metadata_json VARCHAR,
+                geometry_column VARCHAR,
+                geometry_type VARCHAR,
+                crs_info VARCHAR,
+                storage_format VARCHAR,
+                column_types_json VARCHAR,
+                column_duckdb_types_json VARCHAR,
+                column_null_counts_json VARCHAR,
+                column_chunk_counts_json VARCHAR,
+                column_dictionary_encoded_json VARCHAR,
+                column_min_max_json VARCHAR
             )
         """)
         
@@ -96,17 +127,40 @@ class MetadataStore:
             size_bytes: Size of the entry in bytes
             schema: Arrow schema of the cached table
             num_rows: Number of rows in the cached table
-            metadata: Additional metadata for the entry
+            metadata: Additional metadata for the entry (including geometry info and types)
         """
         schema_json = schema.to_string()
-        metadata_json = json.dumps(metadata)
-        
+        # Ensure metadata is stored as JSON string, handle None
+        metadata_json = json.dumps(metadata) if metadata else 'null'
+
+        # Extract values from metadata, providing defaults
+        geometry_column = metadata.get('geometry_column')
+        geometry_type = metadata.get('geometry_type') # This might be added elsewhere or already present
+        crs_info = metadata.get('crs_info') # This might be added elsewhere or already present
+        storage_format = metadata.get('storage_format')
+        column_types_json = metadata.get('column_types_json')
+        column_duckdb_types_json = metadata.get('column_duckdb_types_json')
+        column_null_counts_json = metadata.get('column_null_counts_json')
+        column_chunk_counts_json = metadata.get('column_chunk_counts_json')
+        column_dictionary_encoded_json = metadata.get('column_dictionary_encoded_json')
+        column_min_max_json = metadata.get('column_min_max_json')
+
         self.con.execute("""
-            INSERT OR REPLACE INTO cache_entries
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO cache_entries (
+                key, created_at, last_accessed_at, access_count, expires_at,
+                size_bytes, schema_json, num_rows, metadata_json,
+                geometry_column, geometry_type, crs_info, storage_format,
+                column_types_json, column_duckdb_types_json,
+                column_null_counts_json, column_chunk_counts_json,
+                column_dictionary_encoded_json, column_min_max_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             key, created_at, last_accessed_at, access_count,
-            expires_at, size_bytes, schema_json, num_rows, metadata_json
+            expires_at, size_bytes, schema_json, num_rows, metadata_json,
+            geometry_column, geometry_type, crs_info, storage_format, # Added storage_format
+            column_types_json, column_duckdb_types_json, # Added duckdb types
+            column_null_counts_json, column_chunk_counts_json,
+            column_dictionary_encoded_json, column_min_max_json
         ))
     
     def update_access_stats(self, key: str, last_accessed_at: float, access_count: int) -> None:
@@ -159,10 +213,14 @@ class MetadataStore:
             DataFrame containing metadata for all entries
         """
         return self.con.execute("""
-            SELECT 
+            SELECT
                 e.key, e.created_at, e.last_accessed_at, e.access_count,
                 e.expires_at, e.size_bytes, e.schema_json, e.num_rows,
-                e.metadata_json, 
+                e.metadata_json,
+                e.geometry_column, e.geometry_type, e.crs_info, e.storage_format,
+                e.column_types_json, e.column_duckdb_types_json,
+                e.column_null_counts_json, e.column_chunk_counts_json,
+                e.column_dictionary_encoded_json, e.column_min_max_json,
                 COALESCE(r.is_registered, FALSE) as is_registered,
                 r.last_registered_at
             FROM cache_entries e
@@ -218,128 +276,120 @@ class MetadataStore:
     
     def clear_all_entries(self) -> None:
         """Remove all cache entries from the metadata store."""
-        self.con.execute("DELETE FROM registered_tables")
-        self.con.execute("DELETE FROM cache_entries")
+        try:
+            # First check if the tables exist
+            registered_exists = self.con.execute("""
+                SELECT count(*) FROM sqlite_master 
+                WHERE type='table' AND name='registered_tables'
+            """).fetchone()[0] > 0
+            
+            entries_exists = self.con.execute("""
+                SELECT count(*) FROM sqlite_master 
+                WHERE type='table' AND name='cache_entries'
+            """).fetchone()[0] > 0
+            
+            # Only attempt to delete if tables exist
+            if registered_exists:
+                self.con.execute("DELETE FROM registered_tables")
+            else:
+                logger.warning("registered_tables table does not exist, nothing to clear")
+                
+            if entries_exists:
+                self.con.execute("DELETE FROM cache_entries")
+            else:
+                logger.warning("cache_entries table does not exist, nothing to clear")
+        except Exception as e:
+            logger.error(f"Failed to clear cache entries: {e}")
     
-    def register_table(self, key: str, table: pa.Table, force: bool = False) -> None:
+    def register_table(self, key: str, table: pa.Table) -> None:
         """
-        Register an Arrow table with DuckDB for querying.
+        Register a table with DuckDB for querying.
         
         Args:
-            key: The cache entry key
-            table: The Arrow table to register
-            force: If True, register the table regardless of lazy_registration setting
+            key: Table key
+            table: Arrow table to register
         """
-        # If using lazy registration and not forced, just update the tracking info
-        if self.lazy_registration and not force:
-            # Just update registration tracking without actually registering
-            with self.con_lock:
-                self.con.execute("""
-                    INSERT OR REPLACE INTO registered_tables
-                    VALUES (?, FALSE, ?)
-                """, (key, float(pd.Timestamp.now().timestamp())))
-            return
+        with self.con_lock:
+            try:
+                # First unregister if it already exists
+                self.unregister_table(key)
+                
+                # Check if the key contains special characters that need escaping
+                needs_quoting = '(' in key or ')' in key or ' ' in key or '-' in key or key.isdigit()
+                
+                # Register the table with DuckDB
+                # For tables with special characters, we need to create a view
+                if needs_quoting:
+                    # First register the arrow table with a temporary name
+                    temp_name = f"temp_{uuid.uuid4().hex[:8]}"
+                    self.con.register(temp_name, table)
+                    
+                    # Then create a view with the proper quoted name
+                    # Note: We need to quote the entire view name including the _cache_ prefix
+                    view_name = f"_cache_{key}"
+                    quoted_view_name = f'"{view_name}"'
+                    self.con.execute(f'CREATE OR REPLACE VIEW {quoted_view_name} AS SELECT * FROM {temp_name}')
+                    
+                    # Create an alias without parentheses if needed
+                    if '(' in key and ')' in key:
+                        # Create an alias without the parentheses part
+                        base_key = key.split('(')[0].rstrip('_')
+                        if base_key != key:
+                            try:
+                                alias_view_name = f'_cache_{base_key}'
+                                quoted_alias_name = f'"{alias_view_name}"'
+                                self.con.execute(f'CREATE OR REPLACE VIEW {quoted_alias_name} AS SELECT * FROM {quoted_view_name}')
+                                logger.info(f"Created alias view {alias_view_name} for table with parentheses {view_name}")
+                            except Exception as alias_error:
+                                logger.warning(f"Failed to create alias for table with parentheses: {alias_error}")
+                    
+                    # Unregister the temporary table to clean up
+                    try:
+                        self.con.unregister(temp_name)
+                    except:
+                        pass
+                else:
+                    # For regular table names, use the standard registration
+                    table_name = f"_cache_{key}"
+                    self.con.register(table_name, table)
+                    
+                # Initialize registered_tables if it doesn't exist
+                if not hasattr(self, 'registered_tables'):
+                    self.registered_tables = {}
+                
+                # Store in our collection
+                self.registered_tables[key] = table
+                logger.info(f"Successfully registered table for key: {key}")
+                
+            except Exception as e:
+                logger.error(f"Failed to register table with DuckDB: {e}")
+                raise
+    
+    def register_alias(self, orig_key: str, alias_key: str) -> None:
+        """
+        Register an alias for a table.
+        
+        Args:
+            orig_key: Original table key
+            alias_key: Alias key
+        """
+        with self.con_lock:
+            # Check if the keys need quoting
+            orig_needs_quoting = '(' in orig_key or ')' in orig_key or ' ' in orig_key or '-' in orig_key or orig_key.isdigit()
+            alias_needs_quoting = '(' in alias_key or ')' in alias_key or ' ' in alias_key or '-' in alias_key or alias_key.isdigit()
             
-        # Register the table with DuckDB
-        try:
-            with self.con_lock:
-                # Unregister first if it exists to avoid potential conflicts
-                try:
-                    self.con.unregister(f"_cache_{key}")
-                except Exception:
-                    # Ignore errors during unregister - might not exist yet
-                    pass
-                    
-                # Use efficient zero-copy registration when possible
-                # This uses memory mapping for better performance with Arrow tables
-                try:
-                    # Set PRAGMA to optimize DuckDB for Arrow integration
-                    self.con.execute("PRAGMA enable_object_cache")
-                    self.con.execute("PRAGMA threads=4")  # Use multithreading for better performance 
-                    
-                    # Register with DuckDB with zero_copy flag to avoid data duplication
-                    self.con.register(f"_cache_{key}", table)
-                    
-                    # Add indexing optimization hint for frequently queried tables
-                    try:
-                        # Use heuristic: create automatic indices for small tables (< 100k rows)
-                        if table.num_rows > 0 and table.num_rows < 100000:
-                            num_columns = table.num_columns
-                            # Only create indices for tables with reasonable number of columns
-                            if 1 <= num_columns <= 20:
-                                # Choose most selective columns as candidates for indices
-                                # Heuristic: first column and any ID/key columns are good candidates
-                                candidate_cols = []
-                                
-                                # Add first column as candidate
-                                if num_columns > 0:
-                                    first_col = table.column_names[0]
-                                    candidate_cols.append(first_col)
-                                
-                                # Find ID-like columns
-                                for col in table.column_names:
-                                    col_lower = col.lower()
-                                    if 'id' in col_lower or 'key' in col_lower:
-                                        if col not in candidate_cols:
-                                            candidate_cols.append(col)
-                                
-                                # Limit to max 3 indices
-                                candidate_cols = candidate_cols[:3]
-                                
-                                # Create indices on candidate columns
-                                for col in candidate_cols:
-                                    # Use a safe query with proper escaping
-                                    try:
-                                        # Skip if column has null values - DuckDB doesn't handle them well in indices
-                                        has_nulls = self.con.execute(f"""
-                                            SELECT COUNT(*) FROM _cache_{key} WHERE "{col}" IS NULL LIMIT 1
-                                        """).fetchone()[0] > 0
-                                        
-                                        if not has_nulls:
-                                            # Create the index
-                                            logger.debug(f"Creating automatic index on _cache_{key}.{col}")
-                                            self.con.execute(f"""
-                                                CREATE INDEX IF NOT EXISTS idx_{key}_{col} ON _cache_{key}("{col}")
-                                            """)
-                                    except Exception as idx_err:
-                                        # Skip index creation if it fails, but continue with registration
-                                        logger.debug(f"Skipped index creation for _cache_{key}.{col}: {idx_err}")
-                    except Exception as auto_idx_err:
-                        # Skip automatic indexing if it fails, but continue with registration
-                        logger.debug(f"Skipped automatic indexing for _cache_{key}: {auto_idx_err}")
-
-                except Exception as e:
-                    # If registration fails, try to modify the table to make it more compatible
-                    logger.warning(f"Error registering table '_cache_{key}' with DuckDB: {e}")
-                    
-                    # Try to fix common issues:
-                    # 1. Convert problematic column types to strings
-                    try:
-                        # Convert to pandas, which is more forgiving, then back to Arrow
-                        df = table.to_pandas()
-                        fixed_table = pa.Table.from_pandas(df)
-                        self.con.register(f"_cache_{key}", fixed_table)
-                        logger.info(f"Successfully registered table '_cache_{key}' after type conversion")
-                    except Exception as inner_e:
-                        logger.error(f"Failed to register table '_cache_{key}' even after type conversion: {inner_e}")
-                        # Re-raise the original error
-                        raise e
+            orig_duckdb_key = f'"{orig_key}"' if orig_needs_quoting else orig_key
+            alias_duckdb_key = f'"{alias_key}"' if alias_needs_quoting else alias_key
+            
+            try:
+                # Create a view pointing to the original table
+                self.con.execute(f'CREATE OR REPLACE VIEW _cache_{alias_duckdb_key} AS SELECT * FROM _cache_{orig_duckdb_key}')
                 
-                # Update registration tracking
-                self.con.execute("""
-                    INSERT OR REPLACE INTO registered_tables
-                    VALUES (?, TRUE, ?)
-                """, (key, float(pd.Timestamp.now().timestamp())))
-                
-                # Verify registration was successful by running a test query
-                try:
-                    self.con.execute(f"SELECT COUNT(*) FROM _cache_{key} LIMIT 1")
-                except Exception as e:
-                    logger.error(f"Table '_cache_{key}' registered but failed verification: {e}")
-                    raise
-        except Exception as e:
-            logger.error(f"Failed to register table '_cache_{key}' with DuckDB: {e}")
-            raise
+                # Remember the alias
+                self.table_aliases[alias_key] = orig_key
+            except Exception as e:
+                logger.error(f"Failed to register alias: {e}")
+                raise
     
     def ensure_registered(self, key: str, table: pa.Table) -> None:
         """
@@ -355,7 +405,9 @@ class MetadataStore:
             is_registered = False
             try:
                 # Test if the table is accessible with a simple COUNT query
-                test_query = f"SELECT COUNT(*) FROM _cache_{key} LIMIT 1"
+                # Use double quotes around the table name to handle special characters
+                quoted_table_name = f'"_cache_{key}"'
+                test_query = f"SELECT COUNT(*) FROM {quoted_table_name} LIMIT 1"
                 self.con.execute(test_query)
                 is_registered = True
             except Exception:
@@ -376,30 +428,71 @@ class MetadataStore:
                         logger.warning(f"Table '_cache_{key}' was marked as registered but not accessible. Re-registering.")
                     
                     # Register the table with force=True to ensure it's registered
-                    self.register_table(key, table, force=True)
+                    self.register_table(key, table)
                 except Exception as e:
                     logger.error(f"Failed to register table '_cache_{key}': {e}")
                     raise
     
     def unregister_table(self, key: str) -> None:
         """
-        Unregister an Arrow table from DuckDB.
+        Unregister a table from DuckDB.
         
         Args:
-            key: The cache entry key
+            key: Table key
         """
-        try:
-            # Try to unregister if it exists
-            self.con.unregister(f"_cache_{key}")
-        except:
-            # If it wasn't registered, just ignore
-            pass
-            
-        # Update registration tracking
-        self.con.execute("""
-            DELETE FROM registered_tables
-            WHERE key = ?
-        """, (key,))
+        with self.con_lock:
+            try:
+                # Check if the key contains special characters that need escaping
+                needs_quoting = '(' in key or ')' in key or ' ' in key or '-' in key or key.isdigit()
+                
+                # Remove the DuckDB view or registration
+                if needs_quoting:
+                    # Need to quote the entire view name
+                    view_name = f"_cache_{key}"
+                    quoted_view_name = f'"{view_name}"'
+                    try:
+                        self.con.execute(f'DROP VIEW IF EXISTS {quoted_view_name}')
+                        logger.debug(f"Dropped view {quoted_view_name}")
+                    except Exception as e:
+                        logger.warning(f"Failed to drop view {quoted_view_name}: {e}")
+                    
+                    # Also try to remove any alias created for tables with parentheses
+                    if '(' in key and ')' in key:
+                        base_key = key.split('(')[0].rstrip('_')
+                        if base_key != key:
+                            try:
+                                alias_view_name = f'_cache_{base_key}'
+                                quoted_alias_name = f'"{alias_view_name}"'
+                                self.con.execute(f'DROP VIEW IF EXISTS {quoted_alias_name}')
+                                logger.debug(f"Dropped alias view {quoted_alias_name}")
+                            except Exception as alias_error:
+                                logger.warning(f"Failed to drop alias view: {alias_error}")
+                else:
+                    # For regular tables, use standard unregistration
+                    table_name = f"_cache_{key}"
+                    try:
+                        self.con.unregister(table_name)
+                        logger.debug(f"Unregistered table {table_name}")
+                    except Exception as e:
+                        # If unregister fails, try to drop view as a fallback
+                        try:
+                            self.con.execute(f'DROP VIEW IF EXISTS {table_name}')
+                            logger.debug(f"Dropped view {table_name} as fallback")
+                        except Exception as view_error:
+                            logger.warning(f"Failed to unregister table or drop view {table_name}: {view_error}")
+                
+                # Initialize registered_tables if it doesn't exist
+                if not hasattr(self, 'registered_tables'):
+                    self.registered_tables = {}
+                    
+                # Remove from our internal collection
+                if key in self.registered_tables:
+                    del self.registered_tables[key]
+                    logger.debug(f"Removed table {key} from registered_tables collection")
+                    
+            except Exception as e:
+                logger.warning(f"Error unregistering table: {e}")
+                # Continue execution despite errors - best effort cleanup
     
     def query(self, sql: str) -> pa.Table:
         """
@@ -541,6 +634,16 @@ class MetadataStore:
         """
         with self.con_lock:
             try:
+                # First check if the table exists
+                table_exists = self.con.execute("""
+                    SELECT count(*) FROM sqlite_master 
+                    WHERE type='table' AND name='persistence_metadata'
+                """).fetchone()[0] > 0
+                
+                if not table_exists:
+                    logger.warning("persistence_metadata table does not exist, returning empty list")
+                    return []
+                    
                 result = self.con.execute("""
                     SELECT key, storage_path, is_partitioned, partition_count, created_at, metadata
                     FROM persistence_metadata
@@ -568,39 +671,16 @@ class MetadataStore:
         """
         with self.con_lock:
             try:
+                # First check if the table exists
+                table_exists = self.con.execute("""
+                    SELECT count(*) FROM sqlite_master 
+                    WHERE type='table' AND name='persistence_metadata'
+                """).fetchone()[0] > 0
+                
+                if not table_exists:
+                    logger.warning("persistence_metadata table does not exist, nothing to clear")
+                    return
+                    
                 self.con.execute("DELETE FROM persistence_metadata")
             except Exception as e:
                 logger.error(f"Failed to clear persistence metadata: {e}")
-
-    def register_alias(self, original_key: str, alias_key: str) -> None:
-        """
-        Register an alias for an existing table in DuckDB.
-        
-        Args:
-            original_key: The original table key
-            alias_key: The alias key to register
-        """
-        if not original_key or not alias_key:
-            return
-            
-        # Only register alias if the original table is already registered
-        with self.con_lock:
-            try:
-                # Test if the original table is accessible
-                test_query = f"SELECT COUNT(*) FROM _cache_{original_key} LIMIT 1"
-                self.con.execute(test_query)
-                
-                # Original table exists, create a view for the alias
-                view_sql = f"CREATE OR REPLACE VIEW _cache_{alias_key} AS SELECT * FROM _cache_{original_key}"
-                self.con.execute(view_sql)
-                
-                # Register the alias in our tracking table
-                self.con.execute("""
-                    INSERT OR REPLACE INTO registered_tables
-                    VALUES (?, TRUE, ?)
-                """, (alias_key, float(pd.Timestamp.now().timestamp())))
-                
-                logger.info(f"Created alias '_cache_{alias_key}' for table '_cache_{original_key}'")
-            except Exception as e:
-                logger.error(f"Failed to create alias '_cache_{alias_key}' for table '_cache_{original_key}': {e}")
-                raise

@@ -10,12 +10,60 @@ import tempfile
 import time
 import psutil
 import glob
+import logging
 from typing import Dict, List, Optional, Union, Tuple, Any
 from pathlib import Path
 from urllib.parse import urlparse
 import base64
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# Import our core modules
+from arrow_cache_mcp.core import (
+    get_arrow_cache, 
+    clear_cache_files, 
+    close_cache,
+    remove_dataset,
+    get_datasets_list,
+    get_memory_usage
+)
+
+# Import data loading functions
+from arrow_cache_mcp.loaders import (
+    load_dataset_from_path,
+    load_dataset_from_upload,
+    load_dataset_from_url,
+    guess_format_from_path,
+    SUPPORTED_FORMATS
+)
+
+# Import visualization components
+from arrow_cache_mcp.visualization import (
+    create_plot,
+    render_dataset_card,
+    get_size_display
+)
+
+# Import AI interaction functions
+from arrow_cache_mcp.ai import (
+    get_ai_config,
+    get_claude_api_key,
+    get_ai_provider,
+    ask_ai,
+    ask_claude,
+    extract_and_run_queries,
+    display_conversation_history,
+    _format_datasets_info,
+    HAVE_ANTHROPIC
+)
+
+# Import utilities
+from arrow_cache_mcp.utils import (
+    clean_dataset_name
+)
 
 # ArrowCache for memory management
 from arrow_cache import ArrowCache, ArrowCacheConfig
@@ -727,10 +775,10 @@ async def handle_list_tools() -> list[types.Tool]:
     """
     List available tools in the sandbox.
     """
-    return [
+    tools = [
         types.Tool(
             name="run_sql_query",
-            description="Execute a DuckDB SQL query against cached datasets. Use _cache_<dataset_name> syntax in FROM clause.",
+            description="Execute a DuckDB SQL query against cached datasets. Use _cache_<dataset_name> syntax in FROM clause. always run INSTALL spatial; LOAD spatial; before your main query if you are using spatial functions. Always read the metadata for the dataset to understand columns and storage format.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -811,300 +859,543 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
     ]
 
+    # Add the new Ask Data Analyst tool
+    tools.append(
+        types.Tool(
+            name="ask_data_analyst",
+            description=(
+                "Asks an AI data analyst a question about the loaded datasets. "
+                "The analyst can run SQL queries (using DuckDB syntax and referencing tables as _cache_datasetname) "
+                "and potentially generate visualizations based on the question and data. "
+                "Supports multiple AI providers including Anthropic's Claude and OpenAI models."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question to ask the data analyst."
+                    },
+                },
+                "required": ["question"],
+            }
+        )
+    )
+
+    return tools
+
 @server.call_tool()
 async def handle_call_tool(
     name: str, arguments: dict | None
 ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-    """
-    Handle tool execution requests.
-    Returns results or errors as structured content.
-    """
-    if not sandbox.initialized:
-        return [types.TextContent(type="text", text=json.dumps({"error": "Sandbox not initialized"}))]
+    """Handle tool calls from the client."""
+    logger.info(f"Received tool call: {name} with args: {arguments}")
     
+    # Ensure cache is initialized (it should be by the time tools are called)
     try:
-        if name == "run_sql_query":
-            return await handle_run_sql_query(arguments)
-        elif name == "load_dataset":
-            return await handle_load_dataset(arguments)
-        elif name == "get_dataset_sample":
-            return await handle_get_dataset_sample(arguments)
-        elif name == "get_dataset_info":
-            return await handle_get_dataset_info(arguments)
-        elif name == "remove_dataset":
-            return await handle_remove_dataset(arguments)
-        elif name == "create_plot":
-            return await handle_create_plot(arguments)
-        elif name == "get_memory_usage":
-            return await handle_get_memory_usage(arguments)
-        else:
-            return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
+        get_arrow_cache()
     except Exception as e:
-        print(f"Error in handle_call_tool for {name}: {e}")
-        traceback.print_exc()
-        error_payload = {
-            "status": "error",
-            "tool": name,
-            "error": type(e).__name__,
-            "message": str(e),
-        }
-        return [types.TextContent(type="text", text=json.dumps(error_payload, indent=2))]
+        logger.error(f"Arrow Cache not initialized when handling tool call {name}: {e}")
+        return [types.TextContent(text=f"Error: Cache not available - {e}")]
+
+    # Dispatch to the appropriate handler based on tool name
+    if name == "run_sql_query":
+        return await handle_run_sql_query(arguments)
+    elif name == "load_dataset":
+        return await handle_load_dataset(arguments)
+    elif name == "get_dataset_sample":
+        return await handle_get_dataset_sample(arguments)
+    elif name == "get_dataset_info":
+        return await handle_get_dataset_info(arguments)
+    elif name == "remove_dataset":
+        return await handle_remove_dataset(arguments)
+    elif name == "create_plot":
+        return await handle_create_plot(arguments)
+    elif name == "get_memory_usage":
+        return await handle_get_memory_usage(arguments)
+    elif name == "ask_data_analyst":
+        # Calling the restored full version
+        return await handle_ask_data_analyst(arguments)
+    else:
+        return [
+            types.TextContent(text=f"Error: Unknown tool name '{name}'.")
+        ]
+
+# --- Tool Handler Implementations ---
 
 async def handle_run_sql_query(arguments: dict | None) -> list[types.TextContent]:
-    """Handle the run_sql_query tool."""
-    if not arguments or "query" not in arguments:
-        return [types.TextContent(type="text", text=json.dumps({"error": "Missing 'query' argument"}))]
-    
-    sql_query = arguments["query"]
-    
+    """Handles the 'run_sql_query' tool call."""
+    if not arguments or 'query' not in arguments:
+        return [types.TextContent(text="Error: 'query' argument is required.")]
+
+    query = arguments['query']
+    logger.info(f"Executing SQL query: {query}")
+    cache = get_arrow_cache()
+
     try:
         start_time = time.time()
-        result_df = await asyncio.to_thread(sandbox.query, sql_query)
+        result_df = cache.query(query, optimize=True)
         query_time = time.time() - start_time
-        
-        num_rows = len(result_df)
-        truncated = num_rows > MAX_QUERY_RESULT_ROWS
-        
-        if truncated:
-            result_df = result_df.head(MAX_QUERY_RESULT_ROWS)
-        
-        # For very wide dataframes, limit columns for display
-        if len(result_df.columns) > 20:
-            visible_df = result_df.iloc[:, :20].copy()
-            visible_df['...'] = '...'
-            result_json_str = visible_df.to_json(orient="records", indent=2, date_format='iso')
-            truncated_cols = True
+
+        # Convert to pandas for consistent handling
+        if hasattr(result_df, 'to_pandas'):
+            pandas_df = result_df.to_pandas()
         else:
-            result_json_str = result_df.to_json(orient="records", indent=2, date_format='iso')
-            truncated_cols = False
-        
-        response_payload = {
-            "status": "success",
-            "query": sql_query,
-            "execution_time_seconds": query_time,
-            "rowCount": num_rows,
-            "columnCount": len(result_df.columns),
-            "truncated_rows": truncated,
-            "truncated_columns": truncated_cols,
-            "results": json.loads(result_json_str)
-        }
-        
-        if truncated:
-            response_payload["message"] = f"Result truncated to the first {MAX_QUERY_RESULT_ROWS} rows."
-        
-        if truncated_cols:
-            response_payload["message"] = response_payload.get("message", "") + f" Showing first 20 of {len(result_df.columns)} columns."
-        
-        return [types.TextContent(type="text", text=json.dumps(response_payload, indent=2))]
-    
+            pandas_df = result_df 
+
+        logger.info(f"Query successful. Rows: {len(pandas_df)}, Time: {query_time:.3f}s")
+
+        # Limit rows for display
+        if len(pandas_df) > MAX_QUERY_RESULT_ROWS:
+            result_text = f"Query returned {len(pandas_df)} rows (displaying first {MAX_QUERY_RESULT_ROWS}):\n\n"
+            result_text += pandas_df.head(MAX_QUERY_RESULT_ROWS).to_markdown(index=False)
+        else:
+            result_text = f"Query returned {len(pandas_df)} rows:\n\n"
+            result_text += pandas_df.to_markdown(index=False)
+            
+        result_text += f"\n\n*Query executed in {query_time:.3f}s*"
+        return [types.TextContent(text=result_text)]
+
     except Exception as e:
-        error_payload = {
-            "status": "error",
-            "query": sql_query,
-            "error": type(e).__name__,
-            "message": str(e),
-        }
-        return [types.TextContent(type="text", text=json.dumps(error_payload, indent=2))]
+        logger.error(f"Error executing query '{query}': {e}")
+        return [types.TextContent(text=f"Error executing query: {e}")]
 
 async def handle_load_dataset(arguments: dict | None) -> list[types.TextContent]:
-    """Handle the load_dataset tool."""
-    if not arguments or "source" not in arguments:
-        return [types.TextContent(type="text", text=json.dumps({"error": "Missing 'source' argument"}))]
-    
-    source = arguments["source"]
-    name = arguments.get("name")
-    format = arguments.get("format")
-    
-    # Remove these arguments and pass the rest as kwargs
-    kwargs = {k: v for k, v in arguments.items() if k not in ["source", "name", "format"]}
-    
-    try:
-        # Check if we have enough memory before loading
-        memory_info = sandbox.get_memory_usage()
-        if memory_info["memory_utilization_percent"] > 90 and not sandbox.config.spill_to_disk:
-            warning = "Warning: Memory usage is high (>90%) and spill_to_disk is disabled. This operation may fail."
-        else:
-            warning = None
-        
-        metadata = await asyncio.to_thread(sandbox.load_dataset, source, name, format, **kwargs)
-        
-        response_payload = {
-            "status": "success",
-            "message": f"Dataset '{metadata['name']}' loaded successfully",
-            "warning": warning,
-            "metadata": metadata
-        }
-        
-        return [types.TextContent(type="text", text=json.dumps(response_payload, indent=2))]
-    
-    except Exception as e:
-        error_payload = {
-            "status": "error",
-            "source": source,
-            "error": type(e).__name__,
-            "message": str(e),
-        }
-        return [types.TextContent(type="text", text=json.dumps(error_payload, indent=2))]
+    """Handles the 'load_dataset' tool call."""
+    if not arguments:
+        return [types.TextContent(text="Error: No arguments provided for load_dataset.")]
 
-async def handle_get_dataset_sample(arguments: dict | None) -> list[types.TextContent]:
-    """Handle the get_dataset_sample tool."""
-    if not arguments or "name" not in arguments:
-        return [types.TextContent(type="text", text=json.dumps({"error": "Missing 'name' argument"}))]
-    
-    name = arguments["name"]
-    n = arguments.get("n", 5)
-    
-    try:
-        sample_df = await asyncio.to_thread(sandbox.get_dataset_sample, name, n)
-        
-        response_payload = {
-            "status": "success",
-            "dataset": name,
-            "sample_size": len(sample_df),
-            "columns": list(sample_df.columns),
-            "data": json.loads(sample_df.to_json(orient="records", indent=2, date_format='iso'))
-        }
-        
-        return [types.TextContent(type="text", text=json.dumps(response_payload, indent=2))]
-    
-    except Exception as e:
-        error_payload = {
-            "status": "error",
-            "dataset": name,
-            "error": type(e).__name__,
-            "message": str(e),
-        }
-        return [types.TextContent(type="text", text=json.dumps(error_payload, indent=2))]
+    source = arguments.get('source')
+    name = arguments.get('name')
+    format = arguments.get('format')
+    url = arguments.get('url')
 
-async def handle_get_dataset_info(arguments: dict | None) -> list[types.TextContent]:
-    """Handle the get_dataset_info tool."""
-    if not arguments or "name" not in arguments:
-        return [types.TextContent(type="text", text=json.dumps({"error": "Missing 'name' argument"}))]
-    
-    name = arguments["name"]
-    
-    try:
-        info = await asyncio.to_thread(sandbox.get_dataset_info, name)
-        
-        response_payload = {
-            "status": "success",
-            "dataset": name,
-            "info": info
-        }
-        
-        return [types.TextContent(type="text", text=json.dumps(response_payload, indent=2))]
-    
-    except Exception as e:
-        error_payload = {
-            "status": "error",
-            "dataset": name,
-            "error": type(e).__name__,
-            "message": str(e),
-        }
-        return [types.TextContent(type="text", text=json.dumps(error_payload, indent=2))]
+    # Determine source type (path, upload, url)
+    load_func = None
+    source_desc = ""
+    if source: # Treat source as path first
+        source_desc = f"path '{source}'"
+        load_func = load_dataset_from_path
+        load_args = {'file_path': source, 'dataset_name': name, 'file_format': format}
+    elif url: # Then check URL
+        source_desc = f"URL '{url}'"
+        load_func = load_dataset_from_url
+        load_args = {'url': url, 'dataset_name': name, 'file_format': format}
+    # Simplified: Assume upload handling happens elsewhere or is not the primary focus here
+    # elif 'upload_token' in arguments? Requires more context on MCP uploads.
+    else:
+        return [types.TextContent(text="Error: Missing required argument: 'source' (file path) or 'url'.")]
 
-async def handle_remove_dataset(arguments: dict | None) -> list[types.TextContent]:
-    """Handle the remove_dataset tool."""
-    if not arguments or "name" not in arguments:
-        return [types.TextContent(type="text", text=json.dumps({"error": "Missing 'name' argument"}))]
-    
-    name = arguments["name"]
-    
+    logger.info(f"Attempting to load dataset '{name or 'auto-named'}' from {source_desc}")
+
     try:
-        success = await asyncio.to_thread(sandbox.remove_dataset, name)
+        # Use the appropriate loading function from loaders.py
+        success, message, loaded_name, metadata = await load_func(**load_args) # Use await if load funcs are async
         
         if success:
-            response_payload = {
-                "status": "success",
-                "message": f"Dataset '{name}' removed successfully"
-            }
+            logger.info(f"Successfully loaded dataset '{loaded_name}'")
+            # Render a card with metadata
+            card_html = render_dataset_card(metadata) 
+            # Return success message and card
+            return [
+                types.TextContent(text=message),
+                types.EmbeddedResource(mime_type="text/html", data=card_html)
+            ]
         else:
-            response_payload = {
-                "status": "error",
-                "message": f"Dataset '{name}' not found or could not be removed"
-            }
-        
-        return [types.TextContent(type="text", text=json.dumps(response_payload, indent=2))]
-    
+            logger.error(f"Failed to load dataset from {source_desc}: {message}")
+            return [types.TextContent(text=f"Error loading dataset: {message}")]
+
     except Exception as e:
-        error_payload = {
-            "status": "error",
-            "dataset": name,
-            "error": type(e).__name__,
-            "message": str(e),
-        }
-        return [types.TextContent(type="text", text=json.dumps(error_payload, indent=2))]
+        logger.exception(f"Unexpected error loading dataset from {source_desc}: {e}")
+        return [types.TextContent(text=f"Unexpected error loading dataset: {e}")]
+
+async def handle_get_dataset_sample(arguments: dict | None) -> list[types.TextContent]:
+    """Handles the 'get_dataset_sample' tool call."""
+    if not arguments or 'dataset' not in arguments:
+         return [types.TextContent(text="Error: 'dataset' argument is required.")]
+
+    dataset_name = arguments['dataset']
+    n_rows = arguments.get('n', 5) # Default to 5 rows
+    logger.info(f"Getting sample ({n_rows} rows) for dataset: {dataset_name}")
+    cache = get_arrow_cache()
+
+    if not cache.contains(dataset_name):
+        return [types.TextContent(text=f"Error: Dataset '{dataset_name}' not found.")]
+
+    try:
+        # Use cache.get() for efficient sampling
+        sample_data = cache.get(dataset_name, limit=n_rows)
+        
+        # Convert to pandas for display
+        if hasattr(sample_data, 'to_pandas'):
+            pandas_df = sample_data.to_pandas()
+        else:
+            pandas_df = sample_data
+        
+        response_text = f"Sample ({len(pandas_df)} rows) from dataset '{dataset_name}':\n\n"
+        response_text += pandas_df.to_markdown(index=False)
+        return [types.TextContent(text=response_text)]
+
+    except Exception as e:
+        logger.error(f"Error getting sample for '{dataset_name}': {e}")
+        return [types.TextContent(text=f"Error getting sample: {e}")]
+
+async def handle_get_dataset_info(arguments: dict | None) -> list[types.TextContent | types.EmbeddedResource]:
+    """Handles the 'get_dataset_info' tool call. Returns metadata card."""
+    if not arguments or 'dataset' not in arguments:
+         return [types.TextContent(text="Error: 'dataset' argument is required.")]
+
+    dataset_name = arguments['dataset']
+    logger.info(f"Getting info for dataset: {dataset_name}")
+    cache = get_arrow_cache()
+    
+    # Use get_datasets_list and filter for the specific dataset
+    all_datasets = get_datasets_list() 
+    dataset_info = next((ds for ds in all_datasets if ds['name'] == dataset_name), None)
+
+    if not dataset_info:
+        return [types.TextContent(text=f"Error: Dataset '{dataset_name}' not found.")]
+
+    try:
+        # Render the dataset card using the info
+        card_html = render_dataset_card(dataset_info)
+        # Return the card as embedded HTML
+        return [types.EmbeddedResource(mime_type="text/html", data=card_html)]
+
+    except Exception as e:
+        logger.error(f"Error generating info card for '{dataset_name}': {e}")
+        # Fallback to text description if card fails
+        info_text = json.dumps(dataset_info, indent=2, default=str) # Use default=str for non-serializable types
+        return [types.TextContent(text=f"Dataset Info for '{dataset_name}':\n\n{info_text}\n\n(Error generating card: {e})")]
+
+async def handle_remove_dataset(arguments: dict | None) -> list[types.TextContent]:
+    """Handles the 'remove_dataset' tool call."""
+    if not arguments or 'dataset' not in arguments:
+        return [types.TextContent(text="Error: 'dataset' argument is required.")]
+
+    dataset_name = arguments['dataset']
+    logger.info(f"Attempting to remove dataset: {dataset_name}")
+    
+    # Use the core remove_dataset function
+    success, message = remove_dataset(dataset_name)
+    
+    if success:
+        logger.info(f"Dataset '{dataset_name}' removed successfully.")
+    else:
+        logger.warning(f"Failed to remove dataset '{dataset_name}': {message}")
+        
+    # Return the message from the core function
+    return [types.TextContent(text=message)]
+
+
+# --- Internal Plotting Logic ---
+async def _create_plot_internal(
+    dataset_name: str, 
+    geometry_col: Optional[str] = None,
+    x: Optional[str] = None, 
+    y: Optional[str] = None, 
+    kind: str = 'map', # Default to map if geometry is provided
+    **kwargs
+) -> Tuple[Optional[bytes], Optional[str]]:
+    """Internal logic to generate plot bytes and format.
+    
+    Returns:
+        Tuple of (image_bytes, error_message)
+    """
+    logger.info(f"Initiating internal plot creation for {dataset_name}. Kind: {kind}")
+    cache = get_arrow_cache()
+
+    if not cache.contains(dataset_name):
+        return None, f"Dataset '{dataset_name}' not found."
+
+    # Check if required columns exist
+    try:
+        # Determine required columns for the query
+        required_cols = []
+        if geometry_col: required_cols.append(geometry_col)
+        if x: required_cols.append(x)
+        if y: required_cols.append(y)
+
+        # Use cache.query for robust schema checking if columns are needed
+        available_columns = []
+        if required_cols:
+            try:
+                schema_query = f"SELECT * FROM _cache_{dataset_name} LIMIT 0;"
+                schema_df = cache.query(schema_query).to_pandas() # Get schema via empty query
+                available_columns = schema_df.columns.tolist()
+                logger.info(f"Dataset {dataset_name} columns: {available_columns}")
+            except Exception as schema_e:
+                logger.warning(f"Could not get exact schema for {dataset_name}: {schema_e}. Plotting may fail if columns are missing.")
+                # Attempt to proceed, checks below will handle missing cols error from query
+        else: # No specific columns needed (e.g., just mapping geometry)
+            logger.info("No specific columns requested beyond geometry, skipping detailed schema check.")
+
+        # Check only if we could get the schema
+        if available_columns:
+            missing_cols = [col for col in required_cols if col not in available_columns]
+            if missing_cols:
+                return None, f"Missing required columns in dataset '{dataset_name}': {', '.join(missing_cols)}. Available: {', '.join(available_columns)}"
+        
+        # Specific check for geometry column existence if provided
+        if geometry_col and available_columns and geometry_col not in available_columns:
+             return None, f"Geometry column '{geometry_col}' not found in dataset '{dataset_name}'. Available: {', '.join(available_columns)}"
+
+    except Exception as e:
+        logger.error(f"Error checking schema/columns for {dataset_name}: {e}")
+        return None, f"Error accessing schema for dataset '{dataset_name}': {e}"
+
+    # Determine plot kind if geometry is involved
+    if geometry_col and kind not in ['map', 'scatter']: # Allow scatter for points
+        kind = 'map' # Force to map if geometry provided
+        logger.info(f"Geometry column '{geometry_col}' provided. Setting plot kind to 'map'.")
+
+    try:
+        # Import the visualization create_plot function
+        from .visualization import create_plot
+        from matplotlib.figure import Figure
+        
+        # Pass the dataset name directly to create_plot, which will handle data loading
+        logger.info(f"Calling create_plot with dataset_name: {dataset_name}")
+        fig = create_plot(
+            data=dataset_name,  # Pass the dataset name as a string
+            x=x, 
+            y=y, 
+            geometry_col=geometry_col, 
+            kind=kind, 
+            title=f"{kind.capitalize()} plot for {dataset_name}",
+            **kwargs
+        )
+
+        if fig is None:
+             return None, "Plot generation failed (returned None)."
+
+        # Save plot to bytes buffer
+        buf = io.BytesIO()
+        # Check if it's a matplotlib figure
+        if isinstance(fig, Figure):
+            logger.info("Saving Matplotlib figure to buffer.")
+            fig.savefig(buf, format='png', dpi=DEFAULT_PLOT_DPI, bbox_inches='tight')
+            plt.close(fig) # Close the figure to free memory
+        else:
+             # Assume it's plotly or other object with write_image
+             try:
+                 logger.info("Saving Plotly figure to buffer.")
+                 fig.write_image(buf, format='png')
+             except Exception as write_err:
+                 logger.error(f"Failed to save non-matplotlib figure: {write_err}")
+                 return None, f"Unsupported figure type or error saving: {write_err}"
+
+        buf.seek(0)
+        image_bytes = buf.read()
+        logger.info(f"Plot generated successfully ({len(image_bytes)} bytes).")
+        return image_bytes, None
+
+    except ImportError as ie:
+         logger.error(f"Plotting dependencies missing: {ie}")
+         return None, f"Plotting library error: {ie}. GeoPandas and Matplotlib might be required."
+    except Exception as e:
+        logger.exception(f"Error generating plot for {dataset_name}: {e}") # Log full traceback
+        return None, f"Error creating plot: {traceback.format_exc()}"
+
+# --- Tool Handlers ---
 
 async def handle_create_plot(arguments: dict | None) -> list[types.ImageContent | types.TextContent]:
-    """Handle the create_plot tool."""
-    if not arguments or "dataset_name" not in arguments or "x" not in arguments:
-        return [types.TextContent(type="text", text=json.dumps({"error": "Missing required arguments"}))]
+    """Handles the 'create_plot' tool call."""
+    if not arguments:
+        return [types.TextContent(text="Error: No arguments provided for create_plot.")]
+
+    logger.info(f"Handling create_plot tool call with arguments: {arguments}")
     
-    dataset_name = arguments["dataset_name"]
-    x = arguments["x"]
-    y = arguments.get("y")
-    kind = arguments.get("kind", "line")
+    dataset_name = arguments.get('dataset')
+    if not dataset_name:
+        return [types.TextContent(text="Error: 'dataset' argument is required for create_plot.")]
+
+    # Extract arguments, providing defaults
+    geometry_col = arguments.get('geometry_col')
+    x_col = arguments.get('x')
+    y_col = arguments.get('y')
+    kind = arguments.get('kind', 'map' if geometry_col else 'line') # Default based on geometry
+
+    # Pass other arguments through
+    plot_kwargs = {k: v for k, v in arguments.items() if k not in ['dataset', 'geometry_col', 'x', 'y', 'kind']}
+
+    # Use the internal plotting function
+    image_bytes, error_message = await _create_plot_internal(
+        dataset_name=dataset_name,
+        geometry_col=geometry_col,
+        x=x_col,
+        y=y_col,
+        kind=kind,
+        **plot_kwargs
+    )
+
+    if error_message:
+        logger.error(f"Plot creation failed for tool call: {error_message}")
+        return [types.TextContent(text=f"Error creating plot: {error_message}")]
     
-    # Extract other arguments to pass to plotting function
-    plot_kwargs = {k: v for k, v in arguments.items() 
-                  if k not in ["dataset_name", "x", "y", "kind"]}
+    if image_bytes:
+        logger.info("Returning plot image content.")
+        b64_image = base64.b64encode(image_bytes).decode('utf-8')
+        return [types.ImageContent(source=types.ImageContentSource(media_type="image/png", data=b64_image))]
+    else:
+        # Should not happen if error_message is None, but handle defensively
+        logger.warning("Plot creation returned no bytes and no error.")
+        return [types.TextContent(text="Plot generation failed for an unknown reason.")]
+
+
+# --- Restore the full handler for ask_data_analyst ---
+async def handle_ask_data_analyst(arguments: dict | None) -> list[types.TextContent | types.ImageContent]:
+    """Handles the 'ask_data_analyst' tool call.
     
+    Calls an AI provider, executes queries, handles visualization requests.
+    """
+    if not arguments or 'question' not in arguments:
+        return [types.TextContent(text="Error: 'question' argument is required.")]
+        
+    question = arguments['question']
+    logger.info(f"Handling ask_data_analyst tool call. Question: {question[:100]}...")
+    
+    # Get AI configuration
+    ai_config = get_ai_config()
+    provider_name = ai_config["provider"]
+    api_key = ai_config["api_key"]
+    
+    if not api_key:
+        logger.error(f"API key not found for {provider_name}")
+        return [types.TextContent(text=f"Error: API key not configured for {provider_name}.")]
+        
+    # Get an AI provider instance
+    ai_provider = get_ai_provider()
+    if not ai_provider:
+        logger.error(f"Could not initialize {provider_name} provider")
+        return [types.TextContent(text=f"Error: Could not initialize {provider_name} provider.")]
+
+    # Log API provider information for debugging
+    logger.info(f"Using AI provider: {provider_name}, model: {ai_provider.model}")
+    
+    # Test API connectivity
+    connection_success, connection_message = ai_provider.test_connection()
+    if not connection_success:
+        logger.warning(f"API connectivity test failed: {connection_message}")
+        logger.info("Will attempt API call anyway, as the test may be unreliable")
+    else:
+        logger.info(f"API connectivity test successful: {connection_message}")
+
+    conversation_history = []
+
     try:
-        base64_img, metadata = await asyncio.to_thread(
-            sandbox.create_plot, dataset_name, x, y, kind, **plot_kwargs
+        # Call the AI function from ai.py
+        response_text = ask_ai(
+            question=question,
+            api_key=api_key,
+            provider=provider_name,
+            conversation_history=conversation_history,
+            max_retries=1 # Use default retry
         )
         
-        # Return as image content
-        return [
-            types.ImageContent(
-                type="image",
-                mimeType="image/png",
-                data=base64_img
-            ),
-            types.TextContent(
-                type="text", 
-                text=json.dumps({
-                    "status": "success",
-                    "plot_info": metadata
-                }, indent=2)
-            )
+        logger.info(f"AI response received (length: {len(response_text)}). Checking for visualization tag.")
+        
+        # --- Check for visualization request tag --- 
+        # Regex to find the tag and capture dataset and geometry_col
+        viz_regex_patterns = [
+            # Pattern with quotes
+            r'<visualize\s+dataset=[\'"]([^\'"]+)[\'"]\s+geometry_col=[\'"]([^\'"]+)[\'"]\s*\/?>',
+            # Alternative pattern without quotes
+            r'<visualize\s+dataset=([^\s>]+)\s+geometry_col=([^\s>]+)\s*\/?>'
         ]
-    
+        
+        viz_match = None
+        for pattern in viz_regex_patterns:
+            match = re.search(pattern, response_text, re.IGNORECASE | re.DOTALL)
+            if match:
+                viz_match = match
+                break
+        
+        final_text_content = response_text
+        image_content = None
+
+        if viz_match:
+            logger.info("Visualization tag found in response.")
+            dataset_to_visualize = viz_match.group(1)
+            geometry_col_to_visualize = viz_match.group(2)
+            
+            if not dataset_to_visualize or not geometry_col_to_visualize:
+                logger.warning(f"Visualization tag found but attributes missing/empty: {viz_match.group(0)}")
+                # Keep the tag in the text as it's malformed or incomplete
+            else:
+                logger.info(f"Extracted viz request: dataset='{dataset_to_visualize}', geometry='{geometry_col_to_visualize}'")
+                
+                # Remove the tag from the text response (handle potential surrounding whitespace)
+                pre_tag = response_text[:viz_match.start()].rstrip()
+                post_tag = response_text[viz_match.end():].lstrip()
+                final_text_content = pre_tag + ("\n\n" if pre_tag and post_tag else "") + post_tag # Add spacing if needed
+                
+                # Call the internal plotting logic
+                logger.info(f"Calling internal plot function for '{dataset_to_visualize}'")
+                image_bytes, error_message = await _create_plot_internal(
+                    dataset_name=dataset_to_visualize,
+                    geometry_col=geometry_col_to_visualize,
+                    kind='map' # Assume map for visualize tag
+                )
+                
+                if error_message:
+                    logger.error(f"Visualization generation failed: {error_message}")
+                    # Append error to the text response
+                    final_text_content += f"\n\n**Visualization Error:** Failed to generate map for '{dataset_to_visualize}': {error_message}"
+                elif image_bytes:
+                    logger.info("Visualization generated successfully.")
+                    b64_image = base64.b64encode(image_bytes).decode('utf-8')
+                    image_content = types.ImageContent(source=types.ImageContentSource(media_type="image/png", data=b64_image))
+                else:
+                    logger.warning("Internal plot function returned no image and no error for visualization request.")
+                    final_text_content += f"\n\n**Visualization Note:** Could not generate map for '{dataset_to_visualize}'."
+        else:
+            logger.info("No visualization tag found.")
+            
+        # Prepare results
+        results: list[types.TextContent | types.ImageContent] = []
+        # Ensure final_text_content is not empty before adding
+        if final_text_content:
+            results.append(types.TextContent(text=final_text_content))
+        if image_content:
+            results.append(image_content)
+            
+        # Handle case where both text and image might be empty (e.g., error during initial Claude call before tag parsing)
+        if not results:
+            logger.warning("handle_ask_data_analyst resulted in no content being returned.")
+            results.append(types.TextContent(text="(No response generated)"))
+            
+        return results
+
     except Exception as e:
-        error_payload = {
-            "status": "error",
-            "dataset": dataset_name,
-            "error": type(e).__name__,
-            "message": str(e),
-        }
-        return [types.TextContent(type="text", text=json.dumps(error_payload, indent=2))]
+        logger.exception(f"Error in handle_ask_data_analyst: {e}")
+        return [types.TextContent(text=f"An unexpected error occurred: {e}")]
 
 async def handle_get_memory_usage(arguments: dict | None) -> list[types.TextContent]:
-    """Handle the get_memory_usage tool."""
+    """Handles the 'get_memory_usage' tool call."""
     try:
-        memory_info = await asyncio.to_thread(sandbox.get_memory_usage)
-        
-        response_payload = {
-            "status": "success",
-            "memory_info": memory_info
-        }
-        
-        return [types.TextContent(type="text", text=json.dumps(response_payload, indent=2))]
-    
+        # Use the core get_memory_usage function directly
+        memory_info = get_memory_usage() 
+        # Format the dictionary as a JSON string for display
+        response_text = json.dumps(memory_info, indent=2, default=str) # Add default=str
+        return [types.TextContent(text=response_text)]
     except Exception as e:
-        error_payload = {
-            "status": "error",
-            "error": type(e).__name__,
-            "message": str(e),
-        }
-        return [types.TextContent(type="text", text=json.dumps(error_payload, indent=2))]
+        logger.exception(f"Error getting memory usage: {e}")
+        return [types.TextContent(text=f"Error getting memory usage: {e}")]
 
 async def main():
-    if not sandbox.initialized:
-        print("Server cannot start: Sandbox initialization failed.")
-        return
-    
+    # Initialize Arrow Cache on startup
+    logger.info("Initializing Arrow Cache for server...")
+    try:
+        get_arrow_cache() # Call core function to initialize
+        logger.info("Arrow Cache initialized successfully.")
+    except Exception as e:
+        logger.error(f"FATAL: Failed to initialize Arrow Cache: {e}")
+        logger.error("Server cannot start without Arrow Cache.")
+        return # Exit if cache fails to initialize
+
     # Run the server using stdin/stdout streams
+    logger.info("Starting MCP server...")
     try:
         async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
             await server.run(
@@ -1112,28 +1403,32 @@ async def main():
                 write_stream,
                 InitializationOptions(
                     server_name="arrow-cache-mcp",
-                    server_version="0.2.0",
+                    server_version="0.2.0", # Consider updating version
                     capabilities=server.get_capabilities(
                         notification_options=NotificationOptions(),
                         experimental_capabilities={},
                     ),
                 ),
             )
+    except Exception as e:
+        logger.exception(f"MCP server run failed: {e}")
     finally:
-        # Ensure sandbox is closed properly on server exit
-        if sandbox.initialized:
-            print("Closing DataScienceSandbox...")
-            try:
-                # Wrap close in asyncio.to_thread
-                await asyncio.to_thread(sandbox.close)
-                print("DataScienceSandbox closed.")
-            except Exception as e:
-                print(f"Error closing DataScienceSandbox: {e}")
+        # Cache cleanup is handled by atexit registered in core.py
+        logger.info("MCP server stopped.")
 
 # Add entry point for running the server directly
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Setup basic logging for server startup
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    logger.info("Running server main...")
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Server interrupted by user.")
+    except Exception as e:
+        logger.exception("Unhandled exception during server execution.")
 
-# Make sure to properly close the sandbox at exit
-import atexit
-atexit.register(lambda: sandbox.close() if sandbox.initialized else None)
+# Remove the potentially problematic atexit registration here,
+# rely on the one in core.py
+# import atexit
+# atexit.register(lambda: sandbox.close() if sandbox.initialized else None)

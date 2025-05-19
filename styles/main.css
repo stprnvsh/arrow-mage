@@ -1,0 +1,236 @@
+/* Apple-inspired Design System */
+
+/* Global Typography */
+@import url('https://fonts.googleapis.com/css2?family=SF+Pro+Display:wght@300;400;500;600&display=swap');
+
+* {
+    font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+html, body, [class*="css"] {
+    font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+/* Color scheme */
+:root {
+    --apple-blue: #0071e3;
+    --apple-light-blue: #147ce5;
+    --apple-dark-gray: #1d1d1f;
+    --apple-light-gray: #393939;
+    --apple-bg-dark: #000000;
+    --apple-bg-light: #ffffff;
+    --apple-border: rgba(0, 0, 0, 0.1);
+    --apple-highlight: rgba(0, 113, 227, 0.1);
+    --apple-card-bg: rgba(255, 255, 255, 0.8);
+}
+
+/* Main container styling */
+.main .block-container {
+    padding-top: 2rem;
+    padding-bottom: 2rem;
+    max-width: 1200px;
+}
+
+/* Headers */
+h1, h2, h3, h4, h5, h6 {
+    font-weight: 600;
+    color: var(--apple-dark-gray);
+    letter-spacing: -0.015em;
+}
+
+h1 {
+    font-size: 2.8rem;
+    letter-spacing: -0.022em;
+    margin-bottom: 1.5rem;
+}
+
+h2 {
+    font-size: 2rem;
+    margin-top: 2rem;
+    margin-bottom: 1rem;
+}
+
+h3 {
+    font-size: 1.5rem;
+    margin-top: 1.5rem;
+    margin-bottom: 0.75rem;
+}
+
+/* Streamlit component styling */
+
+/* Button styling */
+.stButton > button {
+    border-radius: 980px;
+    padding: 0.5rem 1.2rem;
+    font-weight: 500;
+    border: none;
+    background-color: var(--apple-blue);
+    color: white;
+    transition: all 0.2s ease;
+}
+
+.stButton > button:hover {
+    background-color: var(--apple-light-blue);
+    transform: scale(1.02);
+}
+
+/* Sidebar styling */
+[data-testid="stSidebar"] {
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-right: 1px solid var(--apple-border);
+}
+
+[data-testid="stSidebar"] > div {
+    padding-top: 2rem;
+}
+
+/* Card styling */
+.data-card {
+    background-color: var(--apple-card-bg);
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin-bottom: 1rem;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+    border: 1px solid var(--apple-border);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    transition: all 0.3s ease;
+}
+
+.data-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+}
+
+/* Dataset card */
+.dataset-card {
+    background-color: var(--apple-card-bg);
+    border-radius: 12px;
+    padding: 1.25rem;
+    margin-bottom: 1rem;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+    border: 1px solid var(--apple-border);
+    transition: all 0.2s ease;
+}
+
+.dataset-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+.dataset-card h4 {
+    font-size: 1.2rem;
+    font-weight: 500;
+    margin-bottom: 0.75rem;
+}
+
+/* AI chat styling */
+.user-message {
+    background-color: rgba(0, 0, 0, 0.1);
+    border-radius: 12px;
+    padding: 1rem;
+    margin-bottom: 1rem;
+    border-left: 3px solid var(--apple-blue);
+}
+
+.claude-message {
+    background-color: rgba(47, 47, 48, 0.8);
+    border-radius: 12px;
+    padding: 1rem;
+    margin-bottom: 1rem;
+    border-left: 3px solid var(--apple-dark-gray);
+}
+
+/* Dataframe styling */
+[data-testid="stTable"] {
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid var(--apple-border);
+}
+
+/* Form elements */
+.stTextInput > div > div > input,
+.stTextArea > div > div > textarea,
+.stSelectbox > div > div > div {
+    border-radius: 8px;
+    border: 1px solid var(--apple-border);
+    padding: 0.5rem 0.75rem;
+}
+
+.stTextInput > div > div > input:focus,
+.stTextArea > div > div > textarea:focus {
+    border-color: var(--apple-blue);
+    box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.2);
+}
+
+/* Memory gauge */
+.memory-gauge .container {
+    background-color: rgba(0, 0, 0, 0.05);
+    height: 8px;
+    border-radius: 4px;
+    margin-bottom: 5px;
+    overflow: hidden;
+}
+
+.memory-gauge .used {
+    background-color: var(--apple-blue);
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.5s ease;
+}
+
+/* Expanders */
+.streamlit-expanderHeader {
+    font-weight: 500;
+    color: var(--apple-dark-gray);
+}
+
+/* Code blocks */
+pre {
+    background-color: rgba(0, 0, 0, 0.03);
+    border-radius: 8px;
+    border: 1px solid var(--apple-border);
+}
+
+/* Tabs styling */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 2px;
+}
+
+.stTabs [data-baseweb="tab"] {
+    border-radius: 8px 8px 0 0;
+    padding: 0.5rem 1rem;
+    font-weight: 500;
+}
+
+.stTabs [aria-selected="true"] {
+    background-color: rgba(0, 113, 227, 0.1);
+    color: var(--apple-blue);
+}
+
+/* Make inputs and text more legible */
+label {
+    font-weight: 500;
+    color: var(--apple-dark-gray);
+}
+
+p {
+    line-height: 1.5;
+}
+
+/* Hide Streamlit branding */
+#MainMenu, footer {
+    visibility: hidden;
+}
+
+/* Status messages */
+.stAlert {
+    background-color: var(--apple-light-gray);
+    border-radius: 8px;
+    border: 1px solid var(--apple-border);
+}
+
+.stAlert > div {
+    padding: 0.75rem 1rem;
+} 

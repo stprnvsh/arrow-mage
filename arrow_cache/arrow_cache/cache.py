@@ -9,16 +9,19 @@ import pandas as pd
 import weakref
 import psutil
 import re
+import json
+import pyarrow.compute as pc
 
 from .cache_entry import CacheEntry
 from .metadata_store import MetadataStore
-from .converters import to_arrow_table, from_arrow_table, estimate_size_bytes
+from .converters import to_arrow_table, from_arrow_table, estimate_size_bytes, _map_arrow_type_to_duckdb, _get_geometry_info
 from .eviction_policy import create_eviction_policy, EvictionPolicy
 from .config import ArrowCacheConfig, DEFAULT_CONFIG
 from .memory import MemoryManager, apply_compression, zero_copy_slice, estimate_table_memory_usage
 from .partitioning import TablePartition, PartitionedTable, partition_table
 from .threading import ThreadPoolManager, AsyncTaskManager, BackgroundProcessingQueue
-from .query_optimization import QueryOptimizer, optimize_duckdb_connection, explain_query
+from .query_optimization import QueryOptimizer, optimize_duckdb_connection, explain_query, prepare_query_for_execution, extract_table_references
+from .duckdb_ingest import import_from_duckdb
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -51,6 +54,14 @@ def _parse_type_str(type_str):
     else:
         # Default to string for unknown types
         return pa.string()
+
+def _is_numeric_type(arrow_type):
+    """Check if an Arrow type is numeric."""
+    return (
+        pa.types.is_integer(arrow_type) or
+        pa.types.is_floating(arrow_type) or
+        pa.types.is_decimal(arrow_type)
+    )
 
 class ArrowCache:
     """
@@ -176,7 +187,7 @@ class ArrowCache:
             ttl: Time-to-live in seconds (None for no expiration)
             metadata: Additional metadata to store with the entry
             overwrite: Whether to overwrite existing entry if key exists
-            preserve_index: Whether to preserve DataFrame indices as columns
+            preserve_index: Whether to preserve DataFrame indices
             auto_partition: Whether to automatically partition large datasets
                 (None uses the config default)
             
@@ -206,50 +217,11 @@ class ArrowCache:
                 **metadata
             }
             
+            # Prepare table and extract metadata from conversion
+            table, conversion_metadata = self._prepare_table_for_put(data, preserve_index, self.config)
+            combined_metadata.update(conversion_metadata) # Merge conversion metadata
+            
             try:
-                # Check if data is already an Arrow table
-                if isinstance(data, pa.Table):
-                    table = data
-                    # Apply compression if configured
-                    if self.config["enable_compression"]:
-                        try:
-                            table = apply_compression(
-                                table,
-                                compression_type=self.config["compression_type"],
-                                compression_level=self.config["compression_level"],
-                                use_dictionary=self.config["dictionary_encoding"]
-                            )
-                        except Exception as e:
-                            logger.error(f"Failed to apply compression: {e}")
-                else:
-                    # For large files, use streaming conversion if enabled
-                    file_size_hint = getattr(data, 'memory_usage', lambda **kwargs: 0)().sum() if hasattr(data, 'memory_usage') else 0
-                    use_streaming = self.config["enable_streaming"] and (
-                        file_size_hint > self.config["max_conversion_memory"] or
-                        isinstance(data, str) and os.path.exists(data) and 
-                        os.path.getsize(data) > self.config["max_conversion_memory"]
-                    )
-                    
-                    if use_streaming:
-                        logger.info(f"Using streaming conversion for large data with key: {key}")
-                        # For very large files, convert and partition directly in chunks
-                        return self._put_streaming(key, data, ttl, combined_metadata, preserve_index)
-                    else:
-                        # Convert to Arrow table using normal method
-                        table = to_arrow_table(data, preserve_index)
-                        
-                        # Apply compression if configured
-                        if self.config["enable_compression"]:
-                            try:
-                                table = apply_compression(
-                                    table,
-                                    compression_type=self.config["compression_type"],
-                                    compression_level=self.config["compression_level"],
-                                    use_dictionary=self.config["dictionary_encoding"]
-                                )
-                            except Exception as e:
-                                logger.error(f"Failed to apply compression: {e}")
-                
                 # Calculate size in bytes using our accurate memory estimation
                 size_bytes = estimate_table_memory_usage(table)
                 
@@ -703,6 +675,15 @@ class ArrowCache:
         Returns:
             Arrow Table with query results
         """
+        # --- Diagnostic: Ensure spatial extension is loaded --- 
+        try:
+            # This is inefficient but helps diagnose if the initial load isn't persisting
+            self.metadata_store.con.execute("LOAD spatial;")
+        except Exception as load_err:
+            logger.warning(f"Diagnostic LOAD spatial before query failed: {load_err}")
+            # Proceed anyway, the original error might provide more info
+        # -----------------------------------------------------
+        
         with self.lock:
             # Ensure DuckDB connection is available
             if self.metadata_store.is_closed:
@@ -722,22 +703,28 @@ class ArrowCache:
                     # Track execution time for performance monitoring
                     start_time = time.time()
                     
-                    # Execute with callbacks for registration and optional deregistration
-                    deregister_callback = self._deregister_tables if auto_deregister else None
-                    result, hints, info = self.query_optimizer.optimize_and_execute(
+                    # Import the optimization functions
+                    from .query_optimization import prepare_query_for_execution, extract_table_references
+                    
+                    # Prepare the query (ensures tables are registered and properly quoted)
+                    prepared_sql = prepare_query_for_execution(
                         self.metadata_store.con, 
                         sql,
-                        ensure_tables_callback=self._ensure_tables_registered,
-                        deregister_tables_callback=deregister_callback
+                        table_registry_callback=self._ensure_tables_registered
                     )
+                    
+                    # Execute the prepared query
+                    result = self.metadata_store.con.execute(prepared_sql).arrow()
                     execution_time = time.time() - start_time
+                    
+                    # Deregister tables if requested
+                    if auto_deregister:
+                        table_refs = extract_table_references(sql)
+                        if table_refs:
+                            self._deregister_tables(table_refs)
                     
                     # Log query performance info
                     logger.info(f"Query executed in {execution_time:.3f}s")
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(f"Query execution info: {info}")
-                        if hints:
-                            logger.debug(f"Query optimization hints: {hints}")
                     
                     # Return the Arrow table directly
                     return result
@@ -766,88 +753,64 @@ class ArrowCache:
     
     def _extract_table_references(self, sql: str) -> List[str]:
         """
-        Extract table references from a SQL query.
+        Extract table references from a SQL query
         
         Args:
             sql: SQL query
             
         Returns:
-            List of table keys referenced in the query
+            List of table references
         """
-        # This is an improved implementation that extracts table names from FROM and JOIN clauses
-        # with special handling for table names with parentheses that might be mistaken for function calls
         tables = []
         
-        # Normalize the query for easier parsing
-        sql = ' '.join(sql.split()).lower()
-        
-        # First, check for table references that look like function calls: table_name(param)
-        func_pattern = re.compile(r'(FROM|JOIN)\s+(?:_cache_)?([a-zA-Z0-9_]+)(\s*\([^)]*\))', re.IGNORECASE)
-        func_matches = func_pattern.findall(sql)
-        
-        for clause, table, params in func_matches:
-            # Sanitize the table name
-            clean_table = table.strip()
+        # Special case pattern for function-like syntax: table_(params)
+        function_pattern = re.compile(r'(FROM|JOIN)\s+(_?cache_[a-zA-Z0-9_]+)_?\s*\(([^)]*)\)', re.IGNORECASE)
+        for match in function_pattern.finditer(sql):
+            # Reconstruct the full table name with parentheses
+            table_base = match.group(2)
+            params = match.group(3)
+            full_table = f"{table_base}({params})"
             
-            # Extract parameter without parentheses and clean it
-            param_content = params.strip()[1:-1].strip()
-            if param_content:
-                # Create possible variations of the table name
-                tables.append(clean_table)  # Base table name
-                
-                # With parameter appended
-                clean_param = re.sub(r'[^a-zA-Z0-9_]', '_', param_content)
-                tables.append(f"{clean_table}_{clean_param}")  # Table with parameter as suffix
+            # Also handle trailing underscore before parentheses
+            if table_base.endswith('_'):
+                full_table = f"{table_base[:-1]}({params})"
             else:
-                tables.append(clean_table)
-        
-        # Look for standard FROM clause tables
-        from_parts = sql.split(' from ')
-        if len(from_parts) > 1:
-            # Get the part after FROM
-            from_part = from_parts[1]
-            # Cut at the next keyword (WHERE, JOIN, GROUP, ORDER, etc.)
-            for keyword in ['where', 'join', 'group', 'order', 'having', 'limit', 'union', 'intersect', 'except']:
-                keyword_parts = from_part.split(f' {keyword} ')
-                if len(keyword_parts) > 1:
-                    from_part = keyword_parts[0]
-            
-            # Extract table names from the FROM clause
-            table_names = [t.strip() for t in from_part.split(',')]
-            for table in table_names:
-                # Handle aliasing (e.g., "table as t" or "table t")
-                table_parts = table.split(' as ')
-                if len(table_parts) > 1:
-                    table = table_parts[0].strip()
-                else:
-                    table_parts = table.split()
-                    if len(table_parts) > 1:
-                        table = table_parts[0].strip()
+                full_table = f"{table_base}({params})"
                 
-                # Handle _cache_ prefix
-                if table.startswith('_cache_'):
-                    tables.append(table[7:])  # Remove '_cache_' prefix
-                else:
-                    tables.append(table)
+            logger.info(f"Extracted table with function-like syntax: {full_table}")
+            tables.append(full_table)
         
-        # Look for JOIN clauses
-        join_parts = sql.split(' join ')
-        for i in range(1, len(join_parts)):
-            join_part = join_parts[i]
-            # Cut at the next ON or USING keyword to isolate table name
-            for keyword in [' on ', ' using ']:
-                keyword_parts = join_part.split(keyword)
-                if len(keyword_parts) > 1:
-                    join_part = keyword_parts[0]
+        # Extract tables from FROM clauses - now also handle table patterns with parentheses
+        # Pattern for FROM with parentheses tables - e.g. FROM _cache_nyc_yellow_taxi_(jan_2023) or FROM cache_nyc_yellow_taxi(jan_2023)
+        from_paren_pattern = re.compile(r'FROM\s+((?:_)?cache_[a-zA-Z0-9_]+\s*\([^)]*\))', re.IGNORECASE)
+        for match in from_paren_pattern.finditer(sql):
+            table_with_params = match.group(1).strip()
+            # Check if not already wrapped in quotes
+            if not (table_with_params.startswith('"') and table_with_params.endswith('"')):
+                tables.append(table_with_params)
+        
+        # Standard FROM pattern (no parentheses)
+        from_pattern = re.compile(r'FROM\s+(?:"|`)?([\w.]+)(?:"|`)?', re.IGNORECASE)
+        for match in from_pattern.finditer(sql):
+            from_table = match.group(1).strip()
+            tables.append(from_table)
             
-            # Get the table name
-            join_table = join_part.split()[0].strip()
+        # Extract tables from JOIN clauses - also handle parentheses tables
+        # Pattern for JOIN with parentheses tables
+        join_paren_pattern = re.compile(r'JOIN\s+((?:_)?cache_[a-zA-Z0-9_]+\s*\([^)]*\))', re.IGNORECASE)
+        for match in join_paren_pattern.finditer(sql):
+            table_with_params = match.group(1).strip()
+            # Check if not already wrapped in quotes
+            if not (table_with_params.startswith('"') and table_with_params.endswith('"')):
+                tables.append(table_with_params)
+        
+        # Standard JOIN pattern
+        join_pattern = re.compile(r'JOIN\s+(?:"|`)?([\w.]+)(?:"|`)?(?:\s+AS\s+[\w.]+|\s+ON\s+|$)', re.IGNORECASE)
+        for match in join_pattern.finditer(sql):
+            join_table = match.group(1).strip()
             
-            # Handle aliasing
-            join_table_parts = join_table.split(' as ')
-            if len(join_table_parts) > 1:
-                join_table = join_table_parts[0].strip()
-            else:
+            # Handle the case where there might be extra parts after the table name
+            if ' ' in join_table:
                 join_table_parts = join_table.split()
                 if len(join_table_parts) > 1:
                     join_table = join_table_parts[0].strip()
@@ -872,16 +835,6 @@ class ArrowCache:
                        'union', 'intersect', 'except', 'by', 'on', 'using', 'distinct', 'all'}
         filtered_tables = [t for t in unique_tables if t.lower() not in sql_keywords]
         
-        # Handle special case for tables with trailing underscore followed by parentheses
-        # For example, "nyc_yellow_taxi_(jan_2023)" or "nyc_yellow_taxi_"
-        for i, table in enumerate(filtered_tables[:]):
-            # Check if the table has a trailing underscore
-            if table.endswith('_'):
-                # Add version without trailing underscore
-                base_table = table[:-1]
-                if base_table not in filtered_tables:
-                    filtered_tables.append(base_table)
-        
         return filtered_tables
     
     def _ensure_tables_registered(self, table_keys: List[str]) -> None:
@@ -905,6 +858,18 @@ class ArrowCache:
             # Handle keys both with and without _cache_ prefix
             key = table_key[7:] if table_key.startswith('_cache_') else table_key
             
+            # Handle special case for table with parentheses
+            has_parentheses = '(' in key and ')' in key
+            if has_parentheses:
+                # Extract the base name before parentheses
+                base_key = key.split('(')[0].rstrip('_')
+                logger.info(f"Extracted base key '{base_key}' from '{key}' for table with parentheses")
+                
+                # Check if the base table exists
+                if base_key in self.entries:
+                    logger.info(f"Found base table '{base_key}' for request with parentheses '{key}'")
+                    key = base_key
+            
             # Skip if already registered in this batch
             if key in registered_tables:
                 continue
@@ -914,7 +879,8 @@ class ArrowCache:
                 try:
                     if key in self.partitioned_tables:
                         # For partitioned tables
-                        table = entry.get_table()  # This will load if needed
+                        partitioned_table = self.partitioned_tables[key]
+                        table = partitioned_table.get_table()  # This will load if needed
                         self.metadata_store.ensure_registered(key, table)
                         logger.info(f"Registered partitioned table '_cache_{key}' with DuckDB")
                     else:
@@ -947,7 +913,8 @@ class ArrowCache:
                         try:
                             entry = self.entries[base_key]
                             if base_key in self.partitioned_tables:
-                                table = entry.get_table()
+                                partitioned_table = self.partitioned_tables[base_key]
+                                table = partitioned_table.get_table()
                                 self.metadata_store.ensure_registered(base_key, table)
                             else:
                                 table = entry.get_table()
@@ -971,7 +938,8 @@ class ArrowCache:
                     try:
                         entry = self.entries[base_key]
                         if base_key in self.partitioned_tables:
-                            table = entry.get_table()
+                            partitioned_table = self.partitioned_tables[base_key]
+                            table = partitioned_table.get_table()
                             self.metadata_store.ensure_registered(base_key, table)
                         else:
                             table = entry.get_table()
@@ -1143,22 +1111,32 @@ class ArrowCache:
                 # Create partitioned table from metadata
                 # Fix the schema parsing issue - parse schema directly from string
                 schema_str = metadata["schema"]
-                
-                # Extract field definitions using regex - safe alternative to Schema.from_string
-                field_matches = re.findall(r'Field\((.*?):', schema_str) or re.findall(r'field_name: (.*?)[,\)]', schema_str)
-                field_types = re.findall(r'type: (.*?)[\),]', schema_str)
-                
+
+                # Corrected regex patterns using raw strings and adjusted matching
+                # Pattern 1: Field(name: type)
+                # Pattern 2: field_name: name, type: type
+                field_matches_1 = re.findall(r'Field\((\w+):', schema_str)
+                field_matches_2 = re.findall(r'field_name:\s*(\w+)', schema_str)
+                field_matches = field_matches_1 if field_matches_1 else field_matches_2
+
+                type_matches = re.findall(r'type:\s*(\S+?)(\)|, nullable=)', schema_str)
+                field_types = [match[0] for match in type_matches] # Extract the type part
+
                 # Create fields from extracted information
                 fields = []
-                for i, name in enumerate(field_matches):
-                    name = name.strip().strip("'\"")
-                    # Default to string type if type extraction fails
-                    field_type = pa.string() if i >= len(field_types) else _parse_type_str(field_types[i])
-                    fields.append(pa.field(name, field_type))
-                
+                if len(field_matches) == len(field_types):
+                    for i, name in enumerate(field_matches):
+                        name = name.strip().strip('"\'')
+                        field_type = _parse_type_str(field_types[i])
+                        fields.append(pa.field(name, field_type))
+                else:
+                     logger.error(f"Schema parsing mismatch for key '{key}': Found {len(field_matches)} names and {len(field_types)} types.")
+                     # Attempt fallback or raise error
+                     raise ValueError(f"Cannot parse schema string for key {key}")
+
                 # Create schema
                 schema = pa.schema(fields)
-                
+
                 partitioned = PartitionedTable(
                     key=key,
                     schema=schema,
@@ -1305,7 +1283,10 @@ class ArrowCache:
         # Stop the checker thread
         self._stop_checker_event.set()
         if self._checker_thread and self._checker_thread.is_alive():
-            self._checker_thread.join(timeout=1.0)
+            try:
+                self._checker_thread.join(timeout=1.0)
+            except Exception as e:
+                logger.warning(f"Error joining checker thread: {e}")
             self._checker_thread = None
         
         # Clean up all persisted files
@@ -1337,20 +1318,41 @@ class ArrowCache:
             # Clean up spill files
             self.cleanup_spill_files()
         
-        # Clear the cache
-        self.clear()
+        # Clear the cache - catch any exceptions
+        try:
+            self.clear()
+        except Exception as e:
+            logger.error(f"Error during cache clear: {e}")
         
         # Close the metadata store
-        self.metadata_store.close()
+        try:
+            self.metadata_store.close()
+        except Exception as e:
+            logger.error(f"Error closing metadata store: {e}")
         
-        # Shutdown thread pools
-        self.thread_pool.shutdown()
+        # Shutdown thread pools - handle RuntimeError
+        try:
+            self.thread_pool.shutdown()
+        except RuntimeError as e:
+            # This can happen if the event loop is already closed
+            logger.warning(f"RuntimeError during thread pool shutdown, likely event loop is closed: {e}")
+        except Exception as e:
+            logger.error(f"Error shutting down thread pool: {e}")
         
-        # Stop background processing
-        self.bg_queue.stop()
+        # Stop background processing - handle RuntimeError
+        try:
+            self.bg_queue.stop()
+        except RuntimeError as e:
+            # This can happen if the event loop is already closed
+            logger.warning(f"RuntimeError during background queue stop, likely event loop is closed: {e}")
+        except Exception as e:
+            logger.error(f"Error stopping background queue: {e}")
         
         # Stop memory manager
-        self.memory_manager.close()
+        try:
+            self.memory_manager.close()
+        except Exception as e:
+            logger.error(f"Error closing memory manager: {e}")
         
         logger.info("Arrow Cache closed and resources cleaned up")
     
@@ -1373,57 +1375,87 @@ class ArrowCache:
         Returns:
             Number of bytes freed
         """
-        logger.info(f"Memory pressure detected: Need to free {needed_bytes} bytes")
+        logger.info(f"Cache memory pressure detected: Need to free {needed_bytes} bytes")
         freed_bytes = 0
         
+        # Check if we're in a reasonable situation before proceeding
+        # If the amount to free is unreasonably large compared to our cache limit,
+        # this might indicate a memory tracking issue
+        if needed_bytes > self.max_size_bytes * 0.8:
+            logger.warning(f"Unreasonably large memory free request: {needed_bytes/(1024*1024):.2f} MB " 
+                          f"(cache limit: {self.max_size_bytes/(1024*1024):.2f} MB)")
+            # Return a small non-zero value to prevent continuous retries
+            return 1024*1024  # Pretend we freed 1MB
+        
         with self.lock:
-            # First, try to spill partitioned tables to disk
-            if self.config["spill_to_disk"] and self.partitioned_tables:
-                # Ensure spill directory exists
-                spill_dir = self.config["spill_directory"]
-                try:
-                    os.makedirs(spill_dir, exist_ok=True)
-                except OSError as e:
-                    logger.error(f"Failed to create spill directory {spill_dir}: {e}")
-                    # Continue with eviction since spilling failed
+            # First, check if we have partitioned tables to spill
+            if not self.config["spill_to_disk"] or not self.partitioned_tables:
+                logger.info("No partitioned tables available for spilling")
+                # Fall back to entry eviction
+                additional_freed = self._evict(needed_bytes)
+                logger.info(f"Freed additional {additional_freed} bytes through eviction")
+                return additional_freed
                 
-                # Get partitioned tables sorted by last access time (oldest first)
-                partitioned_tables = sorted(
-                    self.partitioned_tables.items(),
-                    key=lambda item: self.metadata_store.get_entry_metadata(item[0]).get("last_accessed_at", 0)
-                )
-                
-                # Try to spill partitions from each table
-                for key, partitioned_table in partitioned_tables:
-                    try:
-                        # Skip already persisted tables if we have that information
-                        if hasattr(partitioned_table, 'is_persisted') and partitioned_table.is_persisted:
-                            continue
-                            
-                        logger.debug(f"Attempting to spill partitions from table '_cache_{key}'")
-                        freed = partitioned_table.spill_partitions(spill_dir, needed_bytes - freed_bytes)
-                        freed_bytes += freed
-                        
-                        logger.debug(f"Spilled {freed} bytes from table '_cache_{key}'")
-                        
-                        if freed_bytes >= needed_bytes:
-                            logger.info(f"Successfully freed {freed_bytes} bytes through spilling")
-                            return freed_bytes
-                    except Exception as e:
-                        logger.error(f"Error spilling partitions from table '_cache_{key}': {e}")
-                        # Continue with next table
-        
-            # If we still need more space or spilling failed, evict entries
-            if freed_bytes < needed_bytes:
-                try:
-                    additional_freed = self._evict(needed_bytes - freed_bytes)
-                    freed_bytes += additional_freed
-                    logger.info(f"Freed additional {additional_freed} bytes through eviction")
-                except Exception as e:
-                    logger.error(f"Error evicting entries: {e}")
+            # Get partitioned tables sorted by last access time (oldest first)
+            partitioned_tables = sorted(
+                self.partitioned_tables.items(),
+                key=lambda item: self.metadata_store.get_entry_metadata(item[0]).get("last_accessed_at", 0)
+            )
             
-        return freed_bytes
-        
+            # Count total spillable bytes to see if we have enough to fulfill the request
+            total_spillable = 0
+            spillable_tables = []
+            
+            for key, partitioned_table in partitioned_tables:
+                try:
+                    # Skip already persisted tables
+                    if hasattr(partitioned_table, 'is_persisted') and partitioned_table.is_persisted:
+                        continue
+                        
+                    # Count spillable partitions
+                    spillable = [
+                        partition for partition in partitioned_table.get_partitions()
+                        if not partition.is_pinned and partition.is_loaded
+                    ]
+                    
+                    spillable_bytes = sum(p.size_bytes for p in spillable)
+                    if spillable_bytes > 0:
+                        total_spillable += spillable_bytes
+                        spillable_tables.append((key, partitioned_table, spillable_bytes))
+                except Exception as e:
+                    logger.error(f"Error checking spillable bytes for table '_cache_{key}': {e}")
+            
+            logger.info(f"Found {len(spillable_tables)} tables with {total_spillable/(1024*1024):.2f} MB spillable data")
+            
+            # If we don't have enough spillable data, evict entries as well
+            if total_spillable < needed_bytes * 0.9:  # If we can free less than 90% of what's needed
+                logger.info(f"Not enough spillable data ({total_spillable/(1024*1024):.2f} MB) to free {needed_bytes/(1024*1024):.2f} MB")
+                # Try to evict entries for the remaining amount
+                evict_needed = needed_bytes - total_spillable
+                additional_freed = self._evict(evict_needed)
+                freed_bytes += additional_freed
+                logger.info(f"Freed additional {additional_freed} bytes through eviction")
+            
+            # Try to spill partitions from each table
+            for key, partitioned_table, _ in spillable_tables:
+                try:
+                    logger.debug(f"Attempting to spill partitions from table '_cache_{key}'")
+                    freed = partitioned_table.spill_partitions(spill_dir, needed_bytes - freed_bytes)
+                    freed_bytes += freed
+                    
+                    logger.debug(f"Spilled {freed} bytes from table '_cache_{key}'")
+                    
+                    if freed_bytes >= needed_bytes:
+                        logger.info(f"Successfully freed {freed_bytes} bytes through spilling")
+                        return freed_bytes
+                except Exception as e:
+                    logger.error(f"Error spilling partitions from table '_cache_{key}': {e}")
+                    # Continue with next table
+            
+            # If we get here, we tried everything but couldn't free enough
+            logger.info(f"Freed {freed_bytes} bytes through spilling")
+            return freed_bytes
+    
     def _evict(self, needed_bytes: int) -> int:
         """
         Evict entries to free up space.
@@ -1611,6 +1643,104 @@ class ArrowCache:
                 }
             }
 
+    def _prepare_table_for_put(self, data: Any, preserve_index: bool, config: ArrowCacheConfig) -> Tuple[pa.Table, Dict[str, Any]]:
+        """
+        Prepare data by converting to Arrow table, applying compression, and extracting metadata.
+        
+        Args:
+            data: Data to prepare
+            preserve_index: Whether to preserve DataFrame indices
+            config: Cache configuration
+            
+        Returns:
+            Tuple of (prepared Arrow Table, extracted metadata dictionary)
+        """
+        extracted_metadata = {}
+        
+        # Extract basic metadata from schema if present
+        if hasattr(data, 'schema') and data.schema.metadata:
+            extracted_metadata = {
+                k.decode('utf-8') if isinstance(k, bytes) else k: 
+                v.decode('utf-8') if isinstance(v, bytes) else v 
+                for k, v in data.schema.metadata.items()
+            }
+            
+        # Convert to Arrow table using the updated converters
+        table = to_arrow_table(data, preserve_index)
+        # The metadata from the conversion is now part of the table's schema metadata
+        if table.schema.metadata:
+            # Decode metadata if needed
+            extracted_metadata = {
+                k.decode('utf-8') if isinstance(k, bytes) else k: 
+                v.decode('utf-8') if isinstance(v, bytes) else v 
+                for k, v in table.schema.metadata.items()
+            }
+            
+        # Apply compression if configured
+        if config["enable_compression"]:
+            try:
+                table = apply_compression(
+                    table,
+                    compression_type=config["compression_type"],
+                    compression_level=config["compression_level"],
+                    use_dictionary=config["dictionary_encoding"]
+                )
+            except Exception as e:
+                logger.error(f"Failed to apply compression: {e}")
+                
+        # --- Extract Auto-Metadata using PyArrow and Helpers --- 
+        try:
+            col_types = {}
+            col_duckdb_types = {} # Store DuckDB types
+            col_nulls = {}
+            col_chunks = {}
+            col_dict = {}
+            col_minmax = {}
+
+            for col_name in table.column_names:
+                column = table.column(col_name)
+                arrow_type = column.type
+                col_types[col_name] = str(arrow_type)
+                col_duckdb_types[col_name] = _map_arrow_type_to_duckdb(arrow_type) # Use the new helper
+                col_nulls[col_name] = column.null_count
+                col_chunks[col_name] = column.num_chunks
+                col_dict[col_name] = pa.types.is_dictionary(arrow_type)
+
+                # Calculate min/max only for suitable types
+                if _is_numeric_type(arrow_type) or pa.types.is_temporal(arrow_type):
+                    if column.null_count < len(column): # Avoid error on all-null columns
+                        min_max_val = pc.min_max(column)
+                        # Convert scalar values to standard Python types for JSON serialization
+                        col_minmax[col_name] = {
+                            "min": min_max_val['min'].as_py() if min_max_val['min'].is_valid else None,
+                            "max": min_max_val['max'].as_py() if min_max_val['max'].is_valid else None
+                        }
+                    else:
+                        col_minmax[col_name] = {"min": None, "max": None}
+
+            # Add to extracted_metadata as JSON strings
+            extracted_metadata['column_types_json'] = json.dumps(col_types)
+            extracted_metadata['column_duckdb_types_json'] = json.dumps(col_duckdb_types) # Add DuckDB types
+            extracted_metadata['column_null_counts_json'] = json.dumps(col_nulls)
+            extracted_metadata['column_chunk_counts_json'] = json.dumps(col_chunks)
+            extracted_metadata['column_dictionary_encoded_json'] = json.dumps(col_dict)
+            extracted_metadata['column_min_max_json'] = json.dumps(col_minmax, default=str) # Use default=str for temporal types
+
+            # Get geometry information
+            geom_col, geom_format = _get_geometry_info(table)
+            if geom_col:
+                extracted_metadata['geometry_column'] = geom_col
+                extracted_metadata['storage_format'] = geom_format
+                logger.info(f"Detected geometry column '{geom_col}' with format '{geom_format}'")
+            else:
+                logger.info("No specific geometry column detected.")
+
+        except Exception as meta_extract_error:
+            logger.warning(f"Error extracting auto-metadata: {meta_extract_error}")
+        # ----------------------------------------
+                
+        return table, extracted_metadata
+
     def _put_streaming(
         self,
         key: str,
@@ -1620,13 +1750,13 @@ class ArrowCache:
         preserve_index: bool = True
     ) -> str:
         """
-        Stream large data into partitioned storage to minimize memory usage
+        Stream large data into partitioned storage and handle metadata.
         
         Args:
             key: Key to store the data under
             data: Data to stream (file path, DataFrame, etc.)
             ttl: Time-to-live in seconds
-            metadata: Additional metadata
+            metadata: Initial metadata (will be updated with extracted info)
             preserve_index: Whether to preserve DataFrame indices
             
         Returns:
@@ -1634,41 +1764,66 @@ class ArrowCache:
         """
         logger.info(f"Streaming large data into cache with key: {key}")
         
-        # First, determine the schema by reading a small sample
-        if isinstance(data, str) and os.path.exists(data):
-            # It's a file path - get file extension
-            ext = os.path.splitext(data)[1].lower()
+        with self.lock:
+            # Remove any existing entry with this key
+            if key in self.entries:
+                self._remove_entry(key)
             
-            if ext == '.parquet':
-                import pyarrow.parquet as pq
-                # Read just the schema and a small sample
-                schema = pq.read_schema(data)
-                with pq.ParquetFile(data) as pf:
-                    sample_table = next(pf.iter_batches(batch_size=1000)).to_table()
-            elif ext == '.csv':
-                # Stream from CSV file using pyarrow's CSV reader (schema consistent)
-                try:
-                    chunk_size = self.config["streaming_chunk_size"]
-                    import pyarrow.csv as csv
+            # Create partitioned table
+            partitioned = PartitionedTable(key, None, self.config, metadata or {})
+            
+            # Dictionary to hold metadata extracted during streaming/conversion
+            streaming_metadata = {}
+            
+            try:
+                # Handle file paths
+                if isinstance(data, str) and os.path.exists(data):
+                    ext = os.path.splitext(data)[1].lower()
                     
-                    # Create partitioned table first - will be populated in chunks
-                    partitioned = PartitionedTable(key, None, self.config, metadata)
-                    
-                    # Special handling for nonstandard formats
-                    # Read the first few lines to detect format
-                    with open(data, 'r') as f:
-                        first_lines = [f.readline().strip() for _ in range(10)]
-                        first_lines = [line for line in first_lines if line]  # Remove empty lines
-                    
-                    # [... existing format detection code ...]
-                    
-                    # Read the file directly with Arrow CSV reader in batches
-                    with self.lock:
-                        # Remove any existing entry with this key
-                        if key in self.entries:
-                            self._remove_entry(key)
+                    if ext == '.parquet':
+                        import pyarrow.parquet as pq
                         
-                        # Add the first batch to get the schema
+                        # Initialize with schema
+                        partitioned.schema = pq.read_schema(data)
+                        
+                        # Extract potential Parquet metadata (including geo if saved with GeoPandas)
+                        parquet_metadata = pq.read_metadata(data).metadata
+                        if parquet_metadata:
+                            streaming_metadata.update({
+                                k.decode(): v.decode() for k, v in parquet_metadata.items() if k.decode().startswith('geo')
+                            })
+                            if 'crs_wkt' in streaming_metadata:
+                                streaming_metadata['crs_info'] = streaming_metadata.pop('crs_wkt')
+                            if 'primary_column' in streaming_metadata:
+                                streaming_metadata['geometry_column'] = streaming_metadata.pop('primary_column')
+                            streaming_metadata['storage_format'] = "WKB" # Assume WKB if geo metadata present
+                            
+                        # Stream in batches using PyArrow
+                        with pq.ParquetFile(data) as pf:
+                            for i, batch in enumerate(pf.iter_batches(batch_size=self.config["streaming_chunk_size"])):
+                                table_batch = pa.Table.from_batches([batch])
+                                partitioned.add_partition(table_batch)
+                                
+                                # Log progress periodically
+                                if (i + 1) % 10 == 0:
+                                    logger.debug(f"Added {i + 1} batches, {partitioned.total_rows} rows so far")
+                    
+                    elif ext == '.csv':
+                        import pyarrow.csv as csv
+                        
+                        # Use PyArrow's CSV reader
+                        parse_options = csv.ParseOptions(delimiter=',')
+                        convert_options = csv.ConvertOptions(
+                            include_columns=None,
+                            include_missing_columns=True,
+                            auto_dict_encode=self.config.get("dictionary_encoding", False)
+                        )
+                        read_options = csv.ReadOptions(
+                            use_threads=True,
+                            block_size=self.config["streaming_chunk_size"]
+                        )
+                        
+                        # Stream in batches
                         reader = csv.open_csv(
                             data,
                             read_options=read_options,
@@ -1699,23 +1854,89 @@ class ArrowCache:
                                     logger.debug(f"Added {batch_counter} batches, {partitioned.total_rows} rows so far")
                             except StopIteration:
                                 break
-                        
-                        # Store in our collections
-                        self.entries[key] = partitioned
-                        self.partitioned_tables[key] = partitioned
-                        self.current_size_bytes += partitioned.total_size_bytes
-                        
-                        # Add to metadata store
-                        self._add_partitioned_metadata(key, partitioned, ttl, metadata)
-                        
-                        return key
-                except Exception as e:
-                    logger.error(f"Error using Arrow CSV reader: {e}, falling back to alternative")
-                    # Fall back to other methods
-            # [... continue with existing code ...]
-        
-        # [... existing code ...]
-    
+                    
+                    else:
+                        # For other file types, read with PyArrow if possible
+                        try:
+                            # Try using pyarrow.dataset which handles many file formats
+                            import pyarrow.dataset as ds
+                            dataset = ds.dataset(data)
+                            partitioned.schema = dataset.schema
+                            
+                            for i, batch in enumerate(dataset.scanner(batch_size=self.config["streaming_chunk_size"]).scan_batches()):
+                                table_batch = batch.to_table()
+                                partitioned.add_partition(table_batch)
+                                
+                                # Log progress periodically
+                                if (i + 1) % 10 == 0:
+                                    logger.debug(f"Added {i + 1} batches, {partitioned.total_rows} rows so far")
+                        except Exception as e:
+                            logger.error(f"Error streaming file with pyarrow.dataset: {e}")
+                            raise ValueError(f"Unsupported file format: {ext}")
+                
+                # Handle pandas DataFrames
+                elif hasattr(data, 'to_arrow'):
+                    # Use pandas' to_arrow method if available
+                    table = data.to_arrow()
+                    partitioned.schema = table.schema
+                    
+                    # Split into partitions
+                    partitions = partition_table(
+                        table, 
+                        self.config,
+                        self.config["partition_size_rows"],
+                        self.config["partition_size_bytes"]
+                    )
+                    
+                    for part_table in partitions:
+                        partitioned.add_partition(part_table)
+                
+                # Handle dicts or other objects by converting to PyArrow directly
+                else:
+                    # Convert to Arrow table
+                    table = to_arrow_table(data, preserve_index)
+                    partitioned.schema = table.schema
+                    
+                    # Apply compression if configured
+                    if self.config["enable_compression"]:
+                        try:
+                            table = apply_compression(
+                                table,
+                                compression_type=self.config["compression_type"],
+                                compression_level=self.config["compression_level"],
+                                use_dictionary=self.config["dictionary_encoding"]
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to apply compression: {e}")
+                    
+                    # Split into partitions
+                    partitions = partition_table(
+                        table, 
+                        self.config,
+                        self.config["partition_size_rows"],
+                        self.config["partition_size_bytes"]
+                    )
+                    
+                    for part_table in partitions:
+                        partitioned.add_partition(part_table)
+                
+                # Recalculate the size to ensure accuracy
+                partitioned.recalculate_total_size()
+                
+                # Store in our collections
+                self.entries[key] = partitioned
+                self.partitioned_tables[key] = partitioned
+                self.current_size_bytes += partitioned.total_size_bytes
+                
+                # Add to metadata store
+                self._add_partitioned_metadata(key, partitioned, ttl, metadata or {})
+                
+                return key
+                
+            except Exception as e:
+                logger.error(f"Error in streaming data to cache: {e}")
+                raise
+
     def _add_partitioned_metadata(self, key: str, partitioned: PartitionedTable, ttl: Optional[float], metadata: Dict[str, Any]) -> None:
         """Add partitioned table metadata to metadata store"""
         metadata = metadata or {}
@@ -1752,3 +1973,151 @@ class ArrowCache:
             except Exception as recovery_error:
                 logger.error(f"Failed to recover from schema inconsistency: {recovery_error}")
                 raise
+
+    def import_data(
+        self,
+        key: str,
+        source: str,
+        source_type: str = "auto",
+        connection_options: Optional[Dict[str, Any]] = None,
+        query: Optional[str] = None,
+        table_name: Optional[str] = None,
+        schema: Optional[str] = None,
+        ttl: Optional[float] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        options: Optional[Dict[str, Any]] = None,
+        auto_partition: Optional[bool] = None
+    ) -> str:
+        """
+        Import data from a source directly into the cache using DuckDB's connectors.
+        
+        This method leverages DuckDB's native connectors to import data from various
+        sources like S3, PostgreSQL, Iceberg, etc., directly into the cache.
+        
+        Args:
+            key: Key to store the data under
+            source: Source URI or path (e.g., 's3://bucket/file.parquet', 'postgres://user:pass@host/db')
+            source_type: Source type ('auto', 'parquet', 'csv', 'json', 'postgres', 'iceberg', etc.)
+            connection_options: Connection options for database connectors
+            query: SQL query to execute (for database sources)
+            table_name: Table name to load (for database sources)
+            schema: Schema name for database tables
+            ttl: Time-to-live for the cached data
+            metadata: Additional metadata to store with the cached data
+            options: Additional options for the specific connector
+            auto_partition: Whether to automatically partition large tables
+            
+        Returns:
+            Key of the cached data
+            
+        Examples:
+            # Import from S3
+            cache.import_data(
+                "nyc_taxi", 
+                "s3://bucket/yellow_tripdata_2021-01.parquet",
+                options={"s3_options": {"region": "us-east-1"}}
+            )
+            
+            # Import from PostgreSQL
+            cache.import_data(
+                "customers",
+                "postgresql://user:pass@localhost:5432/mydb",
+                table_name="customers",
+                schema="public"
+            )
+            
+            # Import from Iceberg
+            cache.import_data(
+                "sales",
+                "iceberg://catalog",
+                table_name="sales"
+            )
+        """
+        # Import the data using DuckDB's connectors
+        arrow_table = import_from_duckdb(
+            source=source,
+            source_type=source_type,
+            connection_options=connection_options,
+            query=query,
+            table_name=table_name,
+            schema=schema,
+            options=options
+        )
+        
+        # Store metadata about the import
+        if metadata is None:
+            metadata = {}
+        
+        # Add source information to metadata
+        metadata.update({
+            "source": source,
+            "source_type": source_type,
+            "import_method": "duckdb",
+        })
+        
+        if table_name:
+            metadata["table_name"] = table_name
+        if schema:
+            metadata["schema"] = schema
+        
+        # Use the general put method to store the data
+        # It handles auto-partitioning based on settings
+        return self.put(
+            key=key,
+            data=arrow_table,
+            ttl=ttl,
+            metadata=metadata,
+            overwrite=True,
+            auto_partition=auto_partition
+        )
+    
+    def import_query(
+        self,
+        key: str,
+        sql: str,
+        connection: str,
+        connection_type: str = "postgres",
+        connection_options: Optional[Dict[str, Any]] = None,
+        ttl: Optional[float] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        options: Optional[Dict[str, Any]] = None,
+        auto_partition: Optional[bool] = None
+    ) -> str:
+        """
+        Import data from a SQL query on a remote database directly into the cache.
+        
+        A convenience method for importing data using a SQL query.
+        
+        Args:
+            key: Key to store the data under
+            sql: SQL query to execute
+            connection: Connection string or identifier
+            connection_type: Connection type ('postgres', 'mysql', 'sqlserver', etc.)
+            connection_options: Additional connection options
+            ttl: Time-to-live for the cached data
+            metadata: Additional metadata to store with the cached data
+            options: Additional options for the connector
+            auto_partition: Whether to automatically partition large tables
+            
+        Returns:
+            Key of the cached data
+            
+        Examples:
+            # Import from PostgreSQL using a query
+            cache.import_query(
+                "active_customers",
+                "SELECT * FROM customers WHERE active = TRUE",
+                "postgresql://user:pass@localhost:5432/mydb"
+            )
+        """
+        return self.import_data(
+            key=key,
+            source=connection,
+            source_type=connection_type,
+            connection_options=connection_options,
+            query=sql,
+            ttl=ttl,
+            metadata=metadata,
+            options=options,
+            auto_partition=auto_partition
+        )

@@ -1,0 +1,12 @@
+{
+  "fused:mcp": {
+    "description": "Fetches top posts from Hacker News as a dataframe.\n\nParameters:\nstory_type (str): Type of stories to fetch. Options are:\n                  - \"top\" for top stories\n                  - \"newest\" for latest stories\n\nReturns:\npandas.DataFrame: DataFrame containing HN posts with columns:\n                 id, title, url, score, by (author), time, descendants (comments)",
+    "parameters": [
+      {
+        "name": "story_type",
+        "type": "string",
+        "required": false
+      }
+    ]
+  }
+}
